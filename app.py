@@ -1,20 +1,22 @@
+# app.py
 import streamlit as st
 import pandas as pd
 import zipfile
 import io
 import simplekml
 import re
-from lxml import etree
+import xml.etree.ElementTree as ET
 
 st.set_page_config(page_title="KMZ Generator", layout="wide")
 st.title("KMZ Generator")
-st.write("Upload your Google Earth Seed File (.xlsx).")
+st.write("Upload your Google Earth Seed File (.xlsx). This version injects StyleMaps so Notes reveal on hover.")
 
 # -------------------------
-# Constants and namespaces
+# Constants and helpers
 # -------------------------
 KML_NS = "http://www.opengis.net/kml/2.2"
-NSMAP = {None: KML_NS}
+ET.register_namespace("", KML_NS)
+Q = lambda tag: "{%s}%s" % (KML_NS, tag)
 
 KML_COLOR_MAP = {
     "red": "ff0000ff",
@@ -31,9 +33,6 @@ MAP_NOTE_ICON = "http://www.earthpoint.us/Dots/GoogleEarth/pal3/icon62.png"
 MAP_NOTE_FALLBACK = "https://maps.google.com/mapfiles/kml/pal3/icon54.png"
 RED_X_ICON = "http://maps.google.com/mapfiles/kml/pal3/icon56.png"
 
-# -------------------------
-# Utility helpers
-# -------------------------
 def safe_str(val):
     if pd.isna(val):
         return None
@@ -100,19 +99,16 @@ def set_linestring_style(linestring, color_value):
             linestring.style.linestyle.width = 3
 
 # -------------------------
-# Line helpers (defined before use)
+# Line helpers
 # -------------------------
 def add_multisegment_linestrings(kml_folder, df, color_column="LineStringColor"):
     if df is None:
         return False
-
     coords_segment = []
     created_any = False
-
     for _, row in df.iterrows():
         lat = row.get("Latitude")
         lon = row.get("Longitude")
-
         if pd.isna(lat) or pd.isna(lon):
             if len(coords_segment) >= 2:
                 ls = kml_folder.newlinestring()
@@ -124,12 +120,10 @@ def add_multisegment_linestrings(kml_folder, df, color_column="LineStringColor")
                 created_any = True
             coords_segment = []
             continue
-
         try:
             coords_segment.append((float(lon), float(lat)))
         except:
             continue
-
     if len(coords_segment) >= 2:
         ls = kml_folder.newlinestring()
         ls.coords = coords_segment
@@ -138,11 +132,10 @@ def add_multisegment_linestrings(kml_folder, df, color_column="LineStringColor")
             if len(non_null) > 0:
                 set_linestring_style(ls, non_null.iloc[0])
         created_any = True
-
     return created_any
 
 # -------------------------
-# Simple placemark creators
+# Placemark creators
 # -------------------------
 def add_point_simple(folder, row, name_field="Name", icon_field="Icon", color_field="IconColor", format_agm=False):
     lat = row.get("Latitude")
@@ -154,7 +147,6 @@ def add_point_simple(folder, row, name_field="Name", icon_field="Icon", color_fi
         lon_f = float(lon)
     except:
         return False
-
     p = folder.newpoint()
     raw_name = row.get(name_field)
     if format_agm:
@@ -168,16 +160,13 @@ def add_point_simple(folder, row, name_field="Name", icon_field="Icon", color_fi
 
     except:
         pass
-
     p.coords = [(lon_f, lat_f)]
-
     v = safe_str(row.get(icon_field))
     if v:
         try:
             p.style.iconstyle.icon.href = str(v)
         except:
             pass
-
     if color_field:
         set_icon_color(p, row.get(color_field))
     return True
@@ -192,7 +181,6 @@ def add_note_simple(folder, row, name_field="Name", icon_field="Icon", hide_labe
         lon_f = float(lon)
     except:
         return ""
-
     p = folder.newpoint()
     name_val = safe_str(row.get(name_field)) or ""
     name_str = str(name_val)
@@ -203,9 +191,7 @@ def add_note_simple(folder, row, name_field="Name", icon_field="Icon", hide_labe
 
     except:
         pass
-
     p.coords = [(lon_f, lat_f)]
-
     href = choose_note_icon_href(row.get(icon_field))
     if href:
         try:
@@ -215,7 +201,6 @@ def add_note_simple(folder, row, name_field="Name", icon_field="Icon", hide_labe
                 p.style.iconstyle.icon.href = MAP_NOTE_FALLBACK
             except:
                 pass
-
     try:
         if hide_label:
             p.style.labelstyle.scale = 0.01
@@ -225,107 +210,104 @@ def add_note_simple(folder, row, name_field="Name", icon_field="Icon", hide_labe
             p.style.labelstyle.color = "ffffffff"
     except:
         pass
-
     return href or safe_str(row.get(icon_field)) or ""
 
 # -------------------------
-# Post-process KML to inject StyleMaps (robust, avoids simplekml newstyle issues)
+# Post-process KML using ElementTree (no external deps)
 # -------------------------
-def inject_stylemaps_into_kml(kml_bytes):
-    parser = etree.XMLParser(remove_blank_text=True)
-    root = etree.fromstring(kml_bytes, parser=parser)
-
-    doc = root.find(".//{http://www.opengis.net/kml/2.2}Document")
+def inject_stylemaps_into_kml_bytes(kml_bytes):
+    # parse
+    root = ET.fromstring(kml_bytes)
+    # find Document
+    doc = root.find(".//" + Q("Document"))
     if doc is None:
-        if root.tag == "{http://www.opengis.net/kml/2.2}Document":
+        if root.tag == Q("Document"):
             doc = root
         else:
             return kml_bytes
-
+    # find Notes folder
     notes_folder = None
-    for folder in doc.findall("{http://www.opengis.net/kml/2.2}Folder"):
-        name_el = folder.find("{http://www.opengis.net/kml/2.2}name")
+    for folder in doc.findall(Q("Folder")):
+        name_el = folder.find(Q("name"))
         if name_el is not None and name_el.text and name_el.text.strip().lower() == "notes":
             notes_folder = folder
             break
-
     if notes_folder is None:
         return kml_bytes
-
-    href_to_id = {}
-    href_order = []
-    for pm in notes_folder.findall("{http://www.opengis.net/kml/2.2}Placemark"):
-        icon_href_el = pm.find(".//{http://www.opengis.net/kml/2.2}Icon/{http://www.opengis.net/kml/2.2}href")
+    # collect unique hrefs
+    hrefs = []
+    for pm in notes_folder.findall(Q("Placemark")):
+        icon_href_el = pm.find(".//" + Q("Icon") + "/" + Q("href"))
         if icon_href_el is not None and icon_href_el.text:
             href = icon_href_el.text.strip()
-            if href not in href_to_id:
-                href_order.append(href)
-                href_to_id[href] = None
-
-    for idx, href in enumerate(href_order, start=1):
-        sm_id = f"sm{idx}"
-        style_normal = etree.Element("{%s}Style" % KML_NS, nsmap=NSMAP)
+            if href not in hrefs:
+                hrefs.append(href)
+    # create styles and stylemaps
+    href_to_sm = {}
+    for i, href in enumerate(hrefs, start=1):
+        sm_id = f"sm_{i}"
+        # Normal style
+        style_normal = ET.Element(Q("Style"))
         style_normal.set("id", f"{sm_id}_normal")
-        iconstyle = etree.SubElement(style_normal, "{%s}IconStyle" % KML_NS)
-        icon_el = etree.SubElement(iconstyle, "{%s}Icon" % KML_NS)
-        href_el = etree.SubElement(icon_el, "{%s}href" % KML_NS)
+        iconstyle = ET.SubElement(style_normal, Q("IconStyle"))
+        icon = ET.SubElement(iconstyle, Q("Icon"))
+        href_el = ET.SubElement(icon, Q("href"))
         href_el.text = href
-        label_el = etree.SubElement(style_normal, "{%s}LabelStyle" % KML_NS)
-        scale_el = etree.SubElement(label_el, "{%s}scale" % KML_NS)
-        scale_el.text = "0.01"
-        color_el = etree.SubElement(label_el, "{%s}color" % KML_NS)
-        color_el.text = "00ffffff"
-
-        style_high = etree.Element("{%s}Style" % KML_NS, nsmap=NSMAP)
+        label = ET.SubElement(style_normal, Q("LabelStyle"))
+        scale = ET.SubElement(label, Q("scale"))
+        scale.text = "0.01"
+        color = ET.SubElement(label, Q("color"))
+        color.text = "00ffffff"
+        # Highlight style
+        style_high = ET.Element(Q("Style"))
         style_high.set("id", f"{sm_id}_highlight")
-        iconstyle_h = etree.SubElement(style_high, "{%s}IconStyle" % KML_NS)
-        icon_el_h = etree.SubElement(iconstyle_h, "{%s}Icon" % KML_NS)
-        href_el_h = etree.SubElement(icon_el_h, "{%s}href" % KML_NS)
-        href_el_h.text = href
-        label_el_h = etree.SubElement(style_high, "{%s}LabelStyle" % KML_NS)
-        scale_el_h = etree.SubElement(label_el_h, "{%s}scale" % KML_NS)
-        scale_el_h.text = "1"
-        color_el_h = etree.SubElement(label_el_h, "{%s}color" % KML_NS)
-        color_el_h.text = "ffffffff"
-
-        stylemap = etree.Element("{%s}StyleMap" % KML_NS, nsmap=NSMAP)
+        iconstyle_h = ET.SubElement(style_high, Q("IconStyle"))
+        icon_h = ET.SubElement(iconstyle_h, Q("Icon"))
+        href_h = ET.SubElement(icon_h, Q("href"))
+        href_h.text = href
+        label_h = ET.SubElement(style_high, Q("LabelStyle"))
+        scale_h = ET.SubElement(label_h, Q("scale"))
+        scale_h.text = "1"
+        color_h = ET.SubElement(label_h, Q("color"))
+        color_h.text = "ffffffff"
+        # StyleMap
+        stylemap = ET.Element(Q("StyleMap"))
         stylemap.set("id", sm_id)
-        pair_normal = etree.SubElement(stylemap, "{%s}Pair" % KML_NS)
-        key_normal = etree.SubElement(pair_normal, "{%s}key" % KML_NS)
-        key_normal.text = "normal"
-        styleurl_normal = etree.SubElement(pair_normal, "{%s}styleUrl" % KML_NS)
-        styleurl_normal.text = f"#{sm_id}_normal"
-        pair_high = etree.SubElement(stylemap, "{%s}Pair" % KML_NS)
-        key_high = etree.SubElement(pair_high, "{%s}key" % KML_NS)
-        key_high.text = "highlight"
-        styleurl_high = etree.SubElement(pair_high, "{%s}styleUrl" % KML_NS)
-        styleurl_high.text = f"#{sm_id}_highlight"
-
+        pair_n = ET.SubElement(stylemap, Q("Pair"))
+        key_n = ET.SubElement(pair_n, Q("key"))
+        key_n.text = "normal"
+        styleurl_n = ET.SubElement(pair_n, Q("styleUrl"))
+        styleurl_n.text = f"#{sm_id}_normal"
+        pair_h = ET.SubElement(stylemap, Q("Pair"))
+        key_h = ET.SubElement(pair_h, Q("key"))
+        key_h.text = "highlight"
+        styleurl_h = ET.SubElement(pair_h, Q("styleUrl"))
+        styleurl_h.text = f"#{sm_id}_highlight"
+        # append to Document
         doc.append(style_normal)
         doc.append(style_high)
         doc.append(stylemap)
-
-        href_to_id[href] = sm_id
-
-    for pm in notes_folder.findall("{http://www.opengis.net/kml/2.2}Placemark"):
-        icon_href_el = pm.find(".//{http://www.opengis.net/kml/2.2}Icon/{http://www.opengis.net/kml/2.2}href")
+        href_to_sm[href] = sm_id
+    # assign styleUrl to placemarks in Notes
+    for pm in notes_folder.findall(Q("Placemark")):
+        icon_href_el = pm.find(".//" + Q("Icon") + "/" + Q("href"))
         if icon_href_el is not None and icon_href_el.text:
             href = icon_href_el.text.strip()
-            smid = href_to_id.get(href)
+            smid = href_to_sm.get(href)
             if smid:
-                for existing in pm.findall("{http://www.opengis.net/kml/2.2}styleUrl"):
+                # remove existing styleUrl children
+                for existing in pm.findall(Q("styleUrl")):
                     pm.remove(existing)
-                styleurl_el = etree.SubElement(pm, "{%s}styleUrl" % KML_NS)
+                styleurl_el = ET.SubElement(pm, Q("styleUrl"))
                 styleurl_el.text = f"#{smid}"
-
-    out = etree.tostring(root, pretty_print=True, xml_declaration=True, encoding="utf-8")
+    # return bytes
+    out = ET.tostring(root, encoding="utf-8", xml_declaration=True)
     return out
 
 # -------------------------
 # UI and file handling
 # -------------------------
 uploaded_xlsx = st.file_uploader("Upload Google Earth Seed File (.xlsx)", type=["xlsx"])
-
 if not uploaded_xlsx:
     st.stop()
 
@@ -353,19 +335,15 @@ df_center = get_sheet("CENTERLINE")
 df_notes = get_sheet("NOTES")
 
 tab1, tab2, tab3, tab4 = st.tabs(["AGMs", "Access", "Centerline", "Notes"])
-
 with tab1:
     st.subheader("AGMs")
     st.dataframe(df_agms if df_agms is not None else pd.DataFrame())
-
 with tab2:
     st.subheader("Access")
     st.dataframe(df_access if df_access is not None else pd.DataFrame())
-
 with tab3:
     st.subheader("Centerline")
     st.dataframe(df_center if df_center is not None else pd.DataFrame())
-
 with tab4:
     st.subheader("Notes")
     st.dataframe(df_notes if df_notes is not None else pd.DataFrame())
@@ -393,7 +371,8 @@ if st.button("Generate KMZ"):
             for _, row in df_access.iterrows():
                 add_point_simple(folder, row)
 
-    # Centerline: single LineString, remove consecutive duplicates and avoid closing loop
+    # Centerline: single LineString using all non-empty coords in order
+    # Remove consecutive duplicates and avoid closing loop by dropping final if equal to first
     if df_center is not None:
         folder = kml.newfolder(name="Centerline")
         coords = []
@@ -411,10 +390,8 @@ if st.button("Generate KMZ"):
                 continue
             coords.append(pt)
             prev = pt
-
         if len(coords) >= 2 and coords[0] == coords[-1]:
             coords = coords[:-1]
-
         if len(coords) >= 2:
             ls = kml.newlinestring()
             ls.coords = coords
@@ -434,36 +411,33 @@ if st.button("Generate KMZ"):
             if col.strip().upper() == "HIDENAMEUNTILMOUSEOVER":
                 hide_col = col
                 break
-
         for _, row in df_notes.iterrows():
             hide_flag = False
             if hide_col:
                 val = row.get(hide_col)
                 if pd.notna(val) and str(val).strip().lower() in ("1", "true", "yes", "y", "t"):
                     hide_flag = True
-
             href = add_note_simple(folder, row, hide_label=hide_flag)
-            debug = {
+            notes_debug_rows.append({
                 "Name": str(safe_str(row.get("Name")) or ""),
                 "IconHref": href or "",
                 "HideFlag": bool(hide_flag)
-            }
-            notes_debug_rows.append(debug)
+            })
 
-    # Show debug table
+    # Show debug table if requested
     if debug_mode:
         if notes_debug_rows:
             df_dbg = pd.DataFrame(notes_debug_rows)
             st.subheader("Notes debug output (what will be written into KML)")
-            st.write("IconHref must be a valid image URL for the icon to display. If IconHref is empty, no icon is set.")
+            st.write("Confirm IconHref values. If IconHref is empty, no icon will be set for that placemark.")
             st.dataframe(df_dbg)
         else:
             st.info("No Notes placemarks found or no debug rows generated.")
 
-    # Build KML and inject StyleMaps
+    # Build KML bytes, then inject StyleMaps
     try:
         raw_kml = kml.kml().encode("utf-8")
-        modified_kml = inject_stylemaps_into_kml(raw_kml)
+        modified_kml = inject_stylemaps_into_kml_bytes(raw_kml)
     except Exception as e:
         st.error(f"Failed to build or modify KML: {e}")
         st.stop()
