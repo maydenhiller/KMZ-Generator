@@ -4,325 +4,288 @@ import zipfile
 import io
 import simplekml
 import re
+import xml.etree.ElementTree as ET
+from collections import OrderedDict
 
 st.set_page_config(page_title="KMZ Generator", layout="wide")
 st.title("KMZ Generator")
-st.write("Upload your Google Earth Seed File (.xlsx).")
 
-# ---------------------------------------------------------
-# Constants and helpers
-# ---------------------------------------------------------
-KML_COLOR_MAP = {
-    "red": "ff0000ff",
-    "blue": "ffff0000",
-    "yellow": "ff00ffff",
-    "purple": "ff800080",
-    "green": "ff00ff00",
-    "orange": "ff008cff",
-    "white": "ffffffff",
-    "black": "ff000000"
-}
+KML_NS = "http://www.opengis.net/kml/2.2"
+ET.register_namespace("", KML_NS)
+Q = lambda tag: "{%s}%s" % (KML_NS, tag)
 
 MAP_NOTE_ICON = "http://www.earthpoint.us/Dots/GoogleEarth/pal3/icon62.png"
-MAP_NOTE_FALLBACK = "https://maps.google.com/mapfiles/kml/pal3/icon54.png"
 RED_X_ICON = "http://maps.google.com/mapfiles/kml/pal3/icon56.png"
+MAP_NOTE_FALLBACK = "https://maps.google.com/mapfiles/kml/pal3/icon54.png"
 
-def safe_str(val):
-    if pd.isna(val):
+def safe_str(v):
+    if pd.isna(v):
         return None
-    s = str(val).strip()
-    return s if s != "" else None
+    s = str(v).strip()
+    return s if s else None
 
-def normalize_agm_name(raw_name):
-    s = safe_str(raw_name)
+def normalize_agm_name(v):
+    s = safe_str(v)
     if s is None:
         return ""
-    if re.fullmatch(r"0+\d+", s):
-        return s
     if re.fullmatch(r"\d+", s):
-        if len(s) >= 4:
-            return s
-        if len(s) < 3:
-            return s.zfill(3)
-        return s
+        return s.zfill(3)
     try:
         f = float(s)
         if f.is_integer():
-            i = int(f)
-            s_digits = str(i)
-            if len(s_digits) < 3:
-                return s_digits.zfill(3)
-            return s_digits
+            return str(int(f)).zfill(3)
     except:
         pass
     return s
 
-def set_icon_style(point, icon_value, is_note=False):
-    v = safe_str(icon_value)
-    if is_note:
-        if v is None:
-            return False
-        v_lower = v.lower()
-        if v_lower == "map note":
-            try:
-                point.style.iconstyle.icon.href = MAP_NOTE_ICON
-            except:
-                point.style.iconstyle.icon.href = MAP_NOTE_FALLBACK
-            return True
-        if v_lower == "red x":
-            try:
-                point.style.iconstyle.icon.href = RED_X_ICON
-            except:
-                pass
-            return True
-    if v:
-        try:
-            point.style.iconstyle.icon.href = str(v)
-            return True
-        except:
-            return False
-    return False
+def choose_note_icon_href(v):
+    s = safe_str(v)
+    if s is None:
+        return None
+    s2 = s.lower()
+    if s2 == "map note":
+        return MAP_NOTE_ICON
+    if s2 == "red x":
+        return RED_X_ICON
+    return s
 
-def set_icon_color(point, color_value):
-    c = safe_str(color_value)
-    if not c:
-        return
-    c_lower = c.lower()
-    if c_lower in KML_COLOR_MAP:
-        point.style.iconstyle.color = KML_COLOR_MAP[c_lower]
-    else:
-        if len(c) == 8 and all(ch in "0123456789abcdefABCDEF" for ch in c):
-            point.style.iconstyle.color = c
-
-def set_linestring_style(linestring, color_value):
-    c = safe_str(color_value)
-    if not c:
-        return
-    c_lower = c.lower()
-    if c_lower in KML_COLOR_MAP:
-        linestring.style.linestyle.color = KML_COLOR_MAP[c_lower]
-        linestring.style.linestyle.width = 3
-    else:
-        if len(c) == 8 and all(ch in "0123456789abcdefABCDEF" for ch in c):
-            linestring.style.linestyle.color = c
-            linestring.style.linestyle.width = 3
-
-# Note: this function always sets the placemark name as a string
-def add_point(kml_folder, row, name_field="Name", icon_field="Icon", color_field="IconColor",
-              hide_label=False, format_agm=False, is_note=False):
+def add_point_simple(folder, row, format_agm=False):
     lat = row.get("Latitude")
     lon = row.get("Longitude")
     if pd.isna(lat) or pd.isna(lon):
-        return False
-
+        return
     try:
-        lat_f = float(lat)
-        lon_f = float(lon)
+        lat = float(lat)
+        lon = float(lon)
     except:
-        return False
+        return
 
-    p = kml_folder.newpoint()
+    p = folder.newpoint()
+    name = row.get("Name")
+    p.name = normalize_agm_name(name) if format_agm else safe_str(name) or ""
+    p.description = p.name
+    p.coords = [(lon, lat)]
 
-    raw_name = row.get(name_field)
-    if format_agm:
-        name_val = normalize_agm_name(raw_name)
-    else:
-        name_val = safe_str(raw_name) or ""
+    icon = safe_str(row.get("Icon"))
+    if icon:
+        try:
+            p.style.iconstyle.icon.href = icon
+        except:
+            pass
 
-    # Ensure name is always a string (preserve leading zeros)
-    p.name = str(name_val)
-
-    p.coords = [(lon_f, lat_f)]
-
-    icon_set = set_icon_style(p, row.get(icon_field), is_note=is_note)
-
-    if color_field:
-        set_icon_color(p, row.get(color_field))
-
-    # Hide label until hover: tiny scale + fully transparent color
-    # This requires a valid icon href for Google Earth to show hover behavior reliably.
+def add_note_simple(folder, row):
+    lat = row.get("Latitude")
+    lon = row.get("Longitude")
+    if pd.isna(lat) or pd.isna(lon):
+        return None
     try:
-        if hide_label:
-            p.style.labelstyle.scale = 0.01
-            p.style.labelstyle.color = "00ffffff"
-        else:
-            p.style.labelstyle.scale = 1
-            p.style.labelstyle.color = "ffffffff"
+        lat = float(lat)
+        lon = float(lon)
     except:
-        pass
+        return None
 
-    return icon_set
+    p = folder.newpoint()
+    name = safe_str(row.get("Name")) or ""
+    p.name = name
+    p.description = name
+    p.coords = [(lon, lat)]
 
-def add_multisegment_linestrings(kml_folder, df, color_column="LineStringColor"):
-    if df is None:
-        return False
+    href = choose_note_icon_href(row.get("Icon"))
+    if href:
+        try:
+            p.style.iconstyle.icon.href = href
+        except:
+            p.style.iconstyle.icon.href = MAP_NOTE_FALLBACK
 
-    coords_segment = []
-    created_any = False
+    return href
 
+def add_multisegment_linestrings(folder, df):
+    coords = []
+    created = False
     for _, row in df.iterrows():
         lat = row.get("Latitude")
         lon = row.get("Longitude")
-
         if pd.isna(lat) or pd.isna(lon):
-            if len(coords_segment) >= 2:
-                ls = kml_folder.newlinestring()
-                ls.coords = coords_segment
-                if color_column in df.columns:
-                    non_null = df[color_column].dropna().astype(str).str.strip()
-                    if len(non_null) > 0:
-                        set_linestring_style(ls, non_null.iloc[0])
-                created_any = True
-            coords_segment = []
+            if len(coords) >= 2:
+                ls = folder.newlinestring()
+                ls.coords = coords
+                created = True
+            coords = []
             continue
-
         try:
-            coords_segment.append((float(lon), float(lat)))
+            coords.append((float(lon), float(lat)))
         except:
-            continue
+            pass
 
-    if len(coords_segment) >= 2:
-        ls = kml_folder.newlinestring()
-        ls.coords = coords_segment
-        if color_column in df.columns:
-            non_null = df[color_column].dropna().astype(str).str.strip()
-            if len(non_null) > 0:
-                set_linestring_style(ls, non_null.iloc[0])
-        created_any = True
+    if len(coords) >= 2:
+        ls = folder.newlinestring()
+        ls.coords = coords
+        created = True
 
-    return created_any
+    return created
 
-# ---------------------------------------------------------
-# UI and file handling
-# ---------------------------------------------------------
-uploaded_xlsx = st.file_uploader("Upload Google Earth Seed File (.xlsx)", type=["xlsx"])
+def fix_centerline(doc):
+    for folder in doc.findall(Q("Folder")):
+        name_el = folder.find(Q("name"))
+        if name_el is not None and name_el.text.strip().lower() == "centerline":
+            for ls in folder.findall(".//" + Q("LineString")):
+                coords_el = ls.find(Q("coordinates"))
+                if coords_el is None or not coords_el.text:
+                    continue
 
-if not uploaded_xlsx:
+                raw = coords_el.text.strip().split()
+                pts = []
+                for t in raw:
+                    parts = t.split(",")
+                    if len(parts) >= 2:
+                        try:
+                            pts.append((float(parts[0]), float(parts[1])))
+                        except:
+                            pass
+
+                cleaned = []
+                prev = None
+                for p in pts:
+                    if p != prev:
+                        cleaned.append(p)
+                    prev = p
+
+                if len(cleaned) >= 2 and cleaned[0] == cleaned[-1]:
+                    cleaned = cleaned[:-1]
+
+                coords_el.text = " ".join(f"{lon},{lat},0" for lon, lat in cleaned)
+            return
+
+def inject_stylemaps(doc):
+    notes_folder = None
+    for folder in doc.findall(Q("Folder")):
+        name_el = folder.find(Q("name"))
+        if name_el is not None and name_el.text.strip().lower() == "notes":
+            notes_folder = folder
+            break
+    if notes_folder is None:
+        return
+
+    hrefs = OrderedDict()
+    for pm in notes_folder.findall(Q("Placemark")):
+        href_el = pm.find(".//" + Q("Icon") + "/" + Q("href"))
+        if href_el is not None and href_el.text:
+            href = href_el.text.strip()
+            hrefs[href] = None
+
+    i = 1
+    for href in hrefs.keys():
+        sm_id = f"note_sm_{i}"
+
+        st_norm = ET.Element(Q("Style"), id=f"{sm_id}_normal")
+        ls_norm = ET.SubElement(st_norm, Q("LabelStyle"))
+        ET.SubElement(ls_norm, Q("scale")).text = "0.01"
+        ET.SubElement(ls_norm, Q("color")).text = "00ffffff"
+        is_norm = ET.SubElement(st_norm, Q("IconStyle"))
+        icon_norm = ET.SubElement(is_norm, Q("Icon"))
+        ET.SubElement(icon_norm, Q("href")).text = href
+
+        st_high = ET.Element(Q("Style"), id=f"{sm_id}_highlight")
+        ls_high = ET.SubElement(st_high, Q("LabelStyle"))
+        ET.SubElement(ls_high, Q("scale")).text = "1"
+        ET.SubElement(ls_high, Q("color")).text = "ffffffff"
+        is_high = ET.SubElement(st_high, Q("IconStyle"))
+        icon_high = ET.SubElement(is_high, Q("Icon"))
+        ET.SubElement(icon_high, Q("href")).text = href
+
+        sm = ET.Element(Q("StyleMap"), id=sm_id)
+        p1 = ET.SubElement(sm, Q("Pair"))
+        ET.SubElement(p1, Q("key")).text = "normal"
+        ET.SubElement(p1, Q("styleUrl")).text = f"#{sm_id}_normal"
+        p2 = ET.SubElement(sm, Q("Pair"))
+        ET.SubElement(p2, Q("key")).text = "highlight"
+        ET.SubElement(p2, Q("styleUrl")).text = f"#{sm_id}_highlight"
+
+        doc.append(st_norm)
+        doc.append(st_high)
+        doc.append(sm)
+
+        hrefs[href] = sm_id
+        i += 1
+
+    for pm in notes_folder.findall(Q("Placemark")):
+        href_el = pm.find(".//" + Q("Icon") + "/" + Q("href"))
+        if href_el is not None and href_el.text:
+            href = href_el.text.strip()
+            smid = hrefs.get(href)
+            if smid:
+                for s in pm.findall(Q("styleUrl")):
+                    pm.remove(s)
+                ET.SubElement(pm, Q("styleUrl")).text = f"#{smid}"
+
+uploaded = st.file_uploader("Upload Excel", type=["xlsx"])
+if not uploaded:
     st.stop()
 
-try:
-    df_dict = pd.read_excel(uploaded_xlsx, sheet_name=None)
-except Exception as e:
-    st.error(f"Failed to read Excel file: {e}")
-    st.stop()
+sheets = pd.read_excel(uploaded, sheet_name=None)
+norm = {k.strip().upper(): v for k, v in sheets.items()}
 
-normalized = {k.strip().upper(): v for k, v in df_dict.items()}
+def get_sheet(name):
+    return norm.get(name.upper())
 
-def get_sheet(*names):
-    for n in names:
-        if n is None:
-            continue
-        key = n.strip().upper()
-        df = normalized.get(key)
-        if df is not None and not df.empty:
-            return df
-    return None
-
-df_agms = get_sheet("AGMS", "AGM")
+df_agms = get_sheet("AGMS")
 df_access = get_sheet("ACCESS")
 df_center = get_sheet("CENTERLINE")
 df_notes = get_sheet("NOTES")
 
-tab1, tab2, tab3, tab4 = st.tabs(["AGMs", "Access", "Centerline", "Notes"])
-
-with tab1:
-    st.subheader("AGMs")
-    st.dataframe(df_agms if df_agms is not None else pd.DataFrame())
-
-with tab2:
-    st.subheader("Access")
-    st.dataframe(df_access if df_access is not None else pd.DataFrame())
-
-with tab3:
-    st.subheader("Centerline")
-    st.dataframe(df_center if df_center is not None else pd.DataFrame())
-
-with tab4:
-    st.subheader("Notes")
-    st.dataframe(df_notes if df_notes is not None else pd.DataFrame())
-
-# ---------------------------------------------------------
-# Generate KMZ
-# ---------------------------------------------------------
 if st.button("Generate KMZ"):
     kml = simplekml.Kml()
 
-    # AGMs (format names per your rules)
     if df_agms is not None:
-        folder = kml.newfolder(name="AGMs")
+        f = kml.newfolder(name="AGMs")
         for _, row in df_agms.iterrows():
-            add_point(folder, row, format_agm=True)
+            add_point_simple(f, row, format_agm=True)
 
-    # Access (multi-segment)
     if df_access is not None:
-        folder = kml.newfolder(name="Access")
-        created = add_multisegment_linestrings(folder, df_access)
-        if not created:
+        f = kml.newfolder(name="Access")
+        if not add_multisegment_linestrings(f, df_access):
             for _, row in df_access.iterrows():
-                add_point(folder, row)
+                add_point_simple(f, row)
 
-    # Centerline: single LineString using all non-empty coords in order (left unchanged)
     if df_center is not None:
-        folder = kml.newfolder(name="Centerline")
+        f = kml.newfolder(name="Centerline")
         coords = []
+        prev = None
         for _, row in df_center.iterrows():
             lat = row.get("Latitude")
             lon = row.get("Longitude")
             if pd.isna(lat) or pd.isna(lon):
                 continue
             try:
-                coords.append((float(lon), float(lat)))
+                pt = (float(lon), float(lat))
             except:
                 continue
+            if pt != prev:
+                coords.append(pt)
+            prev = pt
+        if len(coords) >= 2 and coords[0] == coords[-1]:
+            coords = coords[:-1]
         if len(coords) >= 2:
-            ls = folder.newlinestring()
+            ls = f.newlinestring()
             ls.coords = coords
-            if "LineStringColor" in df_center.columns:
-                non_null = df_center["LineStringColor"].dropna().astype(str).str.strip()
-                if len(non_null) > 0:
-                    set_linestring_style(ls, non_null.iloc[0])
-        else:
-            for _, row in df_center.iterrows():
-                add_point(folder, row)
 
-    # Notes: only change here — use keyword mapping and ensure names are strings and hidden until hover when requested
     if df_notes is not None:
-        folder = kml.newfolder(name="Notes")
-        hide_col = None
-        for col in df_notes.columns:
-            if col.strip().upper() == "HIDENAMEUNTILMOUSEOVER":
-                hide_col = col
-                break
-
+        f = kml.newfolder(name="Notes")
         for _, row in df_notes.iterrows():
-            hide_flag = False
-            if hide_col:
-                val = row.get(hide_col)
-                if pd.notna(val) and str(val).strip().lower() in ("1", "true", "yes", "y", "t"):
-                    hide_flag = True
+            add_note_simple(f, row)
 
-            # is_note=True triggers "Map Note" and "Red X" keyword handling
-            add_point(folder, row,
-                      name_field="Name",
-                      icon_field="Icon",
-                      color_field=None,
-                      hide_label=hide_flag,
-                      format_agm=False,
-                      is_note=True)
+    raw = kml.kml().encode("utf-8")
+    root = ET.fromstring(raw)
+    doc = root.find(".//" + Q("Document"))
 
-    # Package KMZ
-    kmz_bytes = io.BytesIO()
-    try:
-        with zipfile.ZipFile(kmz_bytes, "w", zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr("doc.kml", kml.kml())
-    except Exception as e:
-        st.error(f"Failed to build KMZ: {e}")
-        st.stop()
+    inject_stylemaps(doc)
+    fix_centerline(doc)
 
-    st.download_button(
-        label="Download KMZ",
-        data=kmz_bytes.getvalue(),
-        file_name="KMZ_Generator_Output.kmz",
-        mime="application/vnd.google-earth.kmz"
-    )
-    st.success("KMZ generated successfully.")
+    final_kml = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+    kmz = io.BytesIO()
+    with zipfile.ZipFile(kmz, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("doc.kml", final_kml)
+
+    st.download_button("Download KMZ", kmz.getvalue(), "output.kmz")
+    st.success("KMZ generated.")
