@@ -37,17 +37,14 @@ def normalize_agm_name(raw_name):
     s = safe_str(raw_name)
     if s is None:
         return ""
-    # preserve explicit leading zeros
     if re.fullmatch(r"0+\d+", s):
         return s
-    # pure digits without leading zeros
     if re.fullmatch(r"\d+", s):
         if len(s) >= 4:
             return s
         if len(s) < 3:
             return s.zfill(3)
         return s
-    # numeric-like (10.0)
     try:
         f = float(s)
         if f.is_integer():
@@ -71,16 +68,25 @@ def set_icon_style(point, icon_value, is_note=False):
                 point.style.iconstyle.icon.href = MAP_NOTE_ICON
             except:
                 point.style.iconstyle.icon.href = MAP_NOTE_FALLBACK
+            try:
+                point.style.iconstyle.scale = 1
+            except:
+                pass
             return True
         if v_lower == "red x":
             try:
                 point.style.iconstyle.icon.href = RED_X_ICON
+                point.style.iconstyle.scale = 1
             except:
                 pass
             return True
     if v:
         try:
             point.style.iconstyle.icon.href = str(v)
+            try:
+                point.style.iconstyle.scale = 1
+            except:
+                pass
             return True
         except:
             return False
@@ -138,10 +144,8 @@ def add_point(kml_folder, row, name_field="Name", icon_field="Icon", color_field
     # Also set description and balloon text so clicking always shows the name
     p.description = str(name_val)
     try:
-        # BalloonStyle text: show the name (use $[name] token)
         p.style.balloonstyle.text = "<![CDATA[$[name]]]>"
     except:
-        # ignore if simplekml doesn't accept
         pass
 
     p.coords = [(lon_f, lat_f)]
@@ -151,7 +155,7 @@ def add_point(kml_folder, row, name_field="Name", icon_field="Icon", color_field
     if color_field:
         set_icon_color(p, row.get(color_field))
 
-    # Label hiding: tiny scale + fully transparent color so label appears on hover/click
+    # Hide label until hover: tiny scale + fully transparent color so label appears on hover/click
     # Only apply the hide trick if an icon href was set (Google Earth hover behavior is inconsistent otherwise)
     try:
         if hide_label and icon_set:
@@ -274,7 +278,7 @@ if st.button("Generate KMZ"):
                 add_point(folder, row)
 
     # Centerline: single LineString using all non-empty coords in order
-    # Fix: remove consecutive duplicate coordinates to avoid accidental loops
+    # Fix: remove consecutive duplicate coordinates and remove final point if equal to first to avoid loop
     if df_center is not None:
         folder = kml.newfolder(name="Centerline")
         coords = []
@@ -288,21 +292,23 @@ if st.button("Generate KMZ"):
                 pt = (float(lon), float(lat))
             except:
                 continue
-            # skip consecutive duplicates
             if prev is not None and pt == prev:
                 continue
             coords.append(pt)
             prev = pt
 
+        # if first == last, drop last to avoid closed loop
+        if len(coords) >= 2 and coords[0] == coords[-1]:
+            coords = coords[:-1]
+
         if len(coords) >= 2:
-            ls = folder.newlinestring()
+            ls = kml.newlinestring()
             ls.coords = coords
             if "LineStringColor" in df_center.columns:
                 non_null = df_center["LineStringColor"].dropna().astype(str).str.strip()
                 if len(non_null) > 0:
                     set_linestring_style(ls, non_null.iloc[0])
         else:
-            # fallback to points if not enough coords
             for _, row in df_center.iterrows():
                 add_point(folder, row)
 
