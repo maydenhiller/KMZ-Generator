@@ -1,212 +1,328 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<xsl:stylesheet version="1.0"
-    xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+import streamlit as st
+import pandas as pd
+import zipfile
+import io
+import simplekml
+import re
 
-  <xsl:output method="text" omit-xml-declaration="yes" encoding="ISO-8859-1"/>
+st.set_page_config(page_title="KMZ Generator", layout="wide")
+st.title("KMZ Generator")
+st.write("Upload your Google Earth Seed File (.xlsx).")
 
-  <!-- Prevent whitespace nodes from turning into blank output -->
-  <xsl:strip-space elements="*"/>
-  <xsl:template match="text()"/>
+# ---------------------------------------------------------
+# Constants and helpers
+# ---------------------------------------------------------
+KML_COLOR_MAP = {
+    "red": "ff0000ff",
+    "blue": "ffff0000",
+    "yellow": "ff00ffff",
+    "purple": "ff800080",
+    "green": "ff00ff00",
+    "orange": "ff008cff",
+    "white": "ffffffff",
+    "black": "ff000000"
+}
 
-  <!-- ========================= -->
-  <!-- CSV DEFAULT EXTENSION -->
-  <!-- ========================= -->
-  <xsl:variable name="fileExt" select="'csv'"/>
+MAP_NOTE_ICON = "http://www.earthpoint.us/Dots/GoogleEarth/pal3/icon62.png"
+MAP_NOTE_FALLBACK = "https://maps.google.com/mapfiles/kml/pal3/icon54.png"
+RED_X_ICON = "http://maps.google.com/mapfiles/kml/pal3/icon56.png"
 
-  <!-- ========================= -->
-  <!-- Decimal formatting -->
-  <!-- ========================= -->
-  <xsl:variable name="DecPt" select="'.'"/>
-  <xsl:decimal-format name="Standard"
-                      decimal-separator="."
-                      grouping-separator=","
-                      infinity="Infinity"
-                      minus-sign="-"
-                      NaN=""
-                      percent="%"
-                      per-mille="&#2030;"
-                      zero-digit="0"
-                      digit="#"
-                      pattern-separator=";" />
+def safe_str(val):
+    if pd.isna(val):
+        return None
+    s = str(val).strip()
+    return s if s != "" else None
 
-  <xsl:variable name="DecPl0" select="'#0'"/>
-  <xsl:variable name="DecPl1" select="concat('#0', $DecPt, '0')"/>
-  <xsl:variable name="DecPl2" select="concat('#0', $DecPt, '00')"/>
-  <xsl:variable name="DecPl3" select="concat('#0', $DecPt, '000')"/>
-  <xsl:variable name="DecPl4" select="concat('#0', $DecPt, '0000')"/>
-  <xsl:variable name="DecPl5" select="concat('#0', $DecPt, '00000')"/>
-  <xsl:variable name="DecPl8" select="concat('#0', $DecPt, '00000000')"/>
+def normalize_agm_name(raw_name):
+    s = safe_str(raw_name)
+    if s is None:
+        return ""
+    if re.fullmatch(r"0+\d+", s):
+        return s
+    if re.fullmatch(r"\d+", s):
+        if len(s) >= 4:
+            return s
+        if len(s) < 3:
+            return s.zfill(3)
+        return s
+    try:
+        f = float(s)
+        if f.is_integer():
+            i = int(f)
+            s_digits = str(i)
+            if len(s_digits) < 3:
+                return s_digits.zfill(3)
+            return s_digits
+    except:
+        pass
+    return s
 
-  <!-- User fields (kept as-is, even though we now sort by TimeStamp) -->
-  <xsl:variable name="userField1" select="'sortType|Point name sort|stringMenu|2|Numerical|Alphabetical'"/>
-  <xsl:variable name="sortType" select="'Numerical'"/>
+def set_icon_style(point, icon_value, is_note=False):
+    v = safe_str(icon_value)
+    if is_note:
+        if v is None:
+            return False
+        v_lower = v.lower()
+        if v_lower == "map note":
+            try:
+                point.style.iconstyle.icon.href = MAP_NOTE_ICON
+            except:
+                point.style.iconstyle.icon.href = MAP_NOTE_FALLBACK
+            return True
+        if v_lower == "red x":
+            try:
+                point.style.iconstyle.icon.href = RED_X_ICON
+            except:
+                pass
+            return True
+    if v:
+        try:
+            point.style.iconstyle.icon.href = str(v)
+            return True
+        except:
+            return False
+    return False
 
-  <!-- Same key you are using in the working file -->
-  <xsl:key name="obsID-search" match="/JOBFile/FieldBook/PointRecord" use="@ID"/>
+def set_icon_color(point, color_value):
+    c = safe_str(color_value)
+    if not c:
+        return
+    c_lower = c.lower()
+    if c_lower in KML_COLOR_MAP:
+        point.style.iconstyle.color = KML_COLOR_MAP[c_lower]
+    else:
+        if len(c) == 8 and all(ch in "0123456789abcdefABCDEF" for ch in c):
+            point.style.iconstyle.color = c
 
-  <!-- Environment -->
-  <xsl:variable name="DistUnit"   select="/JOBFile/Environment/DisplaySettings/DistanceUnits" />
-  <xsl:variable name="CoordOrder" select="/JOBFile/Environment/DisplaySettings/CoordinateOrder" />
+def set_linestring_style(linestring, color_value):
+    c = safe_str(color_value)
+    if not c:
+        return
+    c_lower = c.lower()
+    if c_lower in KML_COLOR_MAP:
+        linestring.style.linestyle.color = KML_COLOR_MAP[c_lower]
+        linestring.style.linestyle.width = 3
+    else:
+        if len(c) == 8 and all(ch in "0123456789abcdefABCDEF" for ch in c):
+            linestring.style.linestyle.color = c
+            linestring.style.linestyle.width = 3
 
-  <!-- ========================= -->
-  <!-- FORCE US SURVEY FEET OUTPUT -->
-  <!-- ========================= -->
-  <!-- JobXML values are metres; convert to US Survey Feet -->
-  <xsl:variable name="DistConvFactor" select="3.2808333333357"/>
+# Note: this function always sets the placemark name as a string
+def add_point(kml_folder, row, name_field="Name", icon_field="Icon", color_field="IconColor",
+              hide_label=False, format_agm=False, is_note=False):
+    lat = row.get("Latitude")
+    lon = row.get("Longitude")
+    if pd.isna(lat) or pd.isna(lon):
+        return False
 
-  <!-- Coordinate order boolean -->
-  <xsl:variable name="NECoords">
-    <xsl:choose>
-      <xsl:when test="$CoordOrder='North-East-Elevation'">true</xsl:when>
-      <xsl:when test="$CoordOrder='X-Y-Z'">true</xsl:when>
-      <xsl:otherwise>false</xsl:otherwise>
-    </xsl:choose>
-  </xsl:variable>
+    try:
+        lat_f = float(lat)
+        lon_f = float(lon)
+    except:
+        return False
 
-  <!-- ========================= -->
-  <!-- New line (Trimble already normalizes this; DO NOT output CRLF here) -->
-  <!-- ========================= -->
-  <xsl:template name="NewLine">
-    <xsl:text>&#10;</xsl:text>
-  </xsl:template>
+    p = kml_folder.newpoint()
 
-  <!-- ========================= -->
-  <!-- CSV-safe quoting -->
-  <!-- ========================= -->
-  <xsl:template name="CsvQuote">
-    <xsl:param name="s"/>
-    <xsl:text>"</xsl:text>
-    <xsl:call-template name="ReplaceQuotes">
-      <xsl:with-param name="s" select="$s"/>
-    </xsl:call-template>
-    <xsl:text>"</xsl:text>
-  </xsl:template>
+    raw_name = row.get(name_field)
+    if format_agm:
+        name_val = normalize_agm_name(raw_name)
+    else:
+        name_val = safe_str(raw_name) or ""
 
-  <xsl:template name="ReplaceQuotes">
-    <xsl:param name="s"/>
-    <xsl:choose>
-      <xsl:when test="contains($s, '&quot;')">
-        <xsl:value-of select="substring-before($s, '&quot;')"/>
-        <xsl:text>""</xsl:text>
-        <xsl:call-template name="ReplaceQuotes">
-          <xsl:with-param name="s" select="substring-after($s, '&quot;')"/>
-        </xsl:call-template>
-      </xsl:when>
-      <xsl:otherwise>
-        <xsl:value-of select="$s"/>
-      </xsl:otherwise>
-    </xsl:choose>
-  </xsl:template>
+    # Ensure name is always a string (preserve leading zeros)
+    p.name = str(name_val)
 
-  <!-- ========================= -->
-  <!-- MAIN: Header row ONLY -->
-  <!-- ========================= -->
-  <xsl:template match="/">
-    <xsl:choose>
-      <xsl:when test="$NECoords">
-        <xsl:text>Point,North,East,Elev,Code,Hz Prec,Vt Prec,PDOP,Satellites</xsl:text>
-      </xsl:when>
-      <xsl:otherwise>
-        <xsl:text>Point,East,North,Elev,Code,Hz Prec,Vt Prec,PDOP,Satellites</xsl:text>
-      </xsl:otherwise>
-    </xsl:choose>
-    <xsl:call-template name="NewLine"/>
+    p.coords = [(lon_f, lat_f)]
 
-    <xsl:apply-templates select="JOBFile/Reductions"/>
-  </xsl:template>
+    icon_set = set_icon_style(p, row.get(icon_field), is_note=is_note)
 
-  <!-- ========================= -->
-  <!-- Reductions (NOW SORTED BY SHOT TIME) -->
-  <!-- ========================= -->
-  <xsl:template match="Reductions">
-    <xsl:apply-templates select="Point">
-      <!-- Primary sort: observation timestamp from linked PointRecord -->
-      <xsl:sort data-type="text" order="ascending" select="key('obsID-search', ID)[1]/@TimeStamp"/>
-      <!-- Secondary sort to keep stable output when timestamps match -->
-      <xsl:sort data-type="text" order="ascending" select="Name"/>
-    </xsl:apply-templates>
-  </xsl:template>
+    if color_field:
+        set_icon_color(p, row.get(color_field))
 
-  <!-- ========================= -->
-  <!-- Point -> CSV Row (skip blank rows) -->
-  <!-- ========================= -->
-  <xsl:template match="Point">
+    # Hide label until hover: tiny scale + fully transparent color
+    # This requires a valid icon href for Google Earth to show hover behavior reliably.
+    try:
+        if hide_label:
+            p.style.labelstyle.scale = 0.01
+            p.style.labelstyle.color = "00ffffff"
+        else:
+            p.style.labelstyle.scale = 1
+            p.style.labelstyle.color = "ffffffff"
+    except:
+        pass
 
-    <!-- FINAL PROCESSED COORDINATES:
-         Prefer ComputedGrid; if missing, fall back to Grid -->
-    <xsl:variable name="FinalGrid" select="(ComputedGrid | Grid)[1]"/>
+    return icon_set
 
-    <!-- Skip rows that have no point name AND no FINAL grid coordinates -->
-    <xsl:if test="normalize-space(Name) != '' or normalize-space(string($FinalGrid/North)) != '' or normalize-space(string($FinalGrid/East)) != '' or normalize-space(string($FinalGrid/Elevation)) != ''">
+def add_multisegment_linestrings(kml_folder, df, color_column="LineStringColor"):
+    if df is None:
+        return False
 
-      <xsl:variable name="HorizPrec">
-        <xsl:for-each select="key('obsID-search', ID)">
-          <xsl:value-of select="Precision/Horizontal"/>
-        </xsl:for-each>
-      </xsl:variable>
+    coords_segment = []
+    created_any = False
 
-      <xsl:variable name="VertPrec">
-        <xsl:for-each select="key('obsID-search', ID)">
-          <xsl:value-of select="Precision/Vertical"/>
-        </xsl:for-each>
-      </xsl:variable>
+    for _, row in df.iterrows():
+        lat = row.get("Latitude")
+        lon = row.get("Longitude")
 
-      <xsl:variable name="tempPDOP">
-        <xsl:for-each select="key('obsID-search', ID)">
-          <xsl:value-of select="QualityControl1/PDOP"/>
-        </xsl:for-each>
-      </xsl:variable>
+        if pd.isna(lat) or pd.isna(lon):
+            if len(coords_segment) >= 2:
+                ls = kml_folder.newlinestring()
+                ls.coords = coords_segment
+                if color_column in df.columns:
+                    non_null = df[color_column].dropna().astype(str).str.strip()
+                    if len(non_null) > 0:
+                        set_linestring_style(ls, non_null.iloc[0])
+                created_any = True
+            coords_segment = []
+            continue
 
-      <xsl:variable name="tempNbrSat">
-        <xsl:for-each select="key('obsID-search', ID)">
-          <xsl:value-of select="QualityControl1/NumberOfSatellites"/>
-        </xsl:for-each>
-      </xsl:variable>
+        try:
+            coords_segment.append((float(lon), float(lat)))
+        except:
+            continue
 
-      <!-- Point (quoted) -->
-      <xsl:call-template name="CsvQuote">
-        <xsl:with-param name="s" select="Name"/>
-      </xsl:call-template>
-      <xsl:text>,</xsl:text>
+    if len(coords_segment) >= 2:
+        ls = kml_folder.newlinestring()
+        ls.coords = coords_segment
+        if color_column in df.columns:
+            non_null = df[color_column].dropna().astype(str).str.strip()
+            if len(non_null) > 0:
+                set_linestring_style(ls, non_null.iloc[0])
+        created_any = True
 
-      <!-- North/East order based on NECoords -->
-      <xsl:choose>
-        <xsl:when test="$NECoords">
-          <xsl:value-of select="format-number($FinalGrid/North * $DistConvFactor, $DecPl3, 'Standard')"/>
-          <xsl:text>,</xsl:text>
-          <xsl:value-of select="format-number($FinalGrid/East * $DistConvFactor, $DecPl3, 'Standard')"/>
-          <xsl:text>,</xsl:text>
-        </xsl:when>
-        <xsl:otherwise>
-          <xsl:value-of select="format-number($FinalGrid/East * $DistConvFactor, $DecPl3, 'Standard')"/>
-          <xsl:text>,</xsl:text>
-          <xsl:value-of select="format-number($FinalGrid/North * $DistConvFactor, $DecPl3, 'Standard')"/>
-          <xsl:text>,</xsl:text>
-        </xsl:otherwise>
-      </xsl:choose>
+    return created_any
 
-      <!-- Elev -->
-      <xsl:value-of select="format-number($FinalGrid/Elevation * $DistConvFactor, $DecPl3, 'Standard')"/>
-      <xsl:text>,</xsl:text>
+# ---------------------------------------------------------
+# UI and file handling
+# ---------------------------------------------------------
+uploaded_xlsx = st.file_uploader("Upload Google Earth Seed File (.xlsx)", type=["xlsx"])
 
-      <!-- Code (quoted) -->
-      <xsl:call-template name="CsvQuote">
-        <xsl:with-param name="s" select="Code"/>
-      </xsl:call-template>
-      <xsl:text>,</xsl:text>
+if not uploaded_xlsx:
+    st.stop()
 
-      <!-- Hz Prec, Vt Prec, PDOP, Satellites -->
-      <xsl:value-of select="format-number($HorizPrec * $DistConvFactor, $DecPl3, 'Standard')"/>
-      <xsl:text>,</xsl:text>
-      <xsl:value-of select="format-number($VertPrec * $DistConvFactor, $DecPl3, 'Standard')"/>
-      <xsl:text>,</xsl:text>
-      <xsl:value-of select="format-number($tempPDOP, $DecPl1, 'Standard')"/>
-      <xsl:text>,</xsl:text>
-      <xsl:value-of select="format-number($tempNbrSat, $DecPl0, 'Standard')"/>
+try:
+    df_dict = pd.read_excel(uploaded_xlsx, sheet_name=None)
+except Exception as e:
+    st.error(f"Failed to read Excel file: {e}")
+    st.stop()
 
-      <xsl:call-template name="NewLine"/>
+normalized = {k.strip().upper(): v for k, v in df_dict.items()}
 
-    </xsl:if>
-  </xsl:template>
+def get_sheet(*names):
+    for n in names:
+        if n is None:
+            continue
+        key = n.strip().upper()
+        df = normalized.get(key)
+        if df is not None and not df.empty:
+            return df
+    return None
 
-</xsl:stylesheet>
+df_agms = get_sheet("AGMS", "AGM")
+df_access = get_sheet("ACCESS")
+df_center = get_sheet("CENTERLINE")
+df_notes = get_sheet("NOTES")
+
+tab1, tab2, tab3, tab4 = st.tabs(["AGMs", "Access", "Centerline", "Notes"])
+
+with tab1:
+    st.subheader("AGMs")
+    st.dataframe(df_agms if df_agms is not None else pd.DataFrame())
+
+with tab2:
+    st.subheader("Access")
+    st.dataframe(df_access if df_access is not None else pd.DataFrame())
+
+with tab3:
+    st.subheader("Centerline")
+    st.dataframe(df_center if df_center is not None else pd.DataFrame())
+
+with tab4:
+    st.subheader("Notes")
+    st.dataframe(df_notes if df_notes is not None else pd.DataFrame())
+
+# ---------------------------------------------------------
+# Generate KMZ
+# ---------------------------------------------------------
+if st.button("Generate KMZ"):
+    kml = simplekml.Kml()
+
+    # AGMs (format names per your rules)
+    if df_agms is not None:
+        folder = kml.newfolder(name="AGMs")
+        for _, row in df_agms.iterrows():
+            add_point(folder, row, format_agm=True)
+
+    # Access (multi-segment)
+    if df_access is not None:
+        folder = kml.newfolder(name="Access")
+        created = add_multisegment_linestrings(folder, df_access)
+        if not created:
+            for _, row in df_access.iterrows():
+                add_point(folder, row)
+
+    # Centerline: single LineString using all non-empty coords in order (left unchanged)
+    if df_center is not None:
+        folder = kml.newfolder(name="Centerline")
+        coords = []
+        for _, row in df_center.iterrows():
+            lat = row.get("Latitude")
+            lon = row.get("Longitude")
+            if pd.isna(lat) or pd.isna(lon):
+                continue
+            try:
+                coords.append((float(lon), float(lat)))
+            except:
+                continue
+        if len(coords) >= 2:
+            ls = folder.newlinestring()
+            ls.coords = coords
+            if "LineStringColor" in df_center.columns:
+                non_null = df_center["LineStringColor"].dropna().astype(str).str.strip()
+                if len(non_null) > 0:
+                    set_linestring_style(ls, non_null.iloc[0])
+        else:
+            for _, row in df_center.iterrows():
+                add_point(folder, row)
+
+    # Notes: only change here — use keyword mapping and ensure names are strings and hidden until hover when requested
+    if df_notes is not None:
+        folder = kml.newfolder(name="Notes")
+        hide_col = None
+        for col in df_notes.columns:
+            if col.strip().upper() == "HIDENAMEUNTILMOUSEOVER":
+                hide_col = col
+                break
+
+        for _, row in df_notes.iterrows():
+            hide_flag = False
+            if hide_col:
+                val = row.get(hide_col)
+                if pd.notna(val) and str(val).strip().lower() in ("1", "true", "yes", "y", "t"):
+                    hide_flag = True
+
+            # is_note=True triggers "Map Note" and "Red X" keyword handling
+            add_point(folder, row,
+                      name_field="Name",
+                      icon_field="Icon",
+                      color_field=None,
+                      hide_label=hide_flag,
+                      format_agm=False,
+                      is_note=True)
+
+    # Package KMZ
+    kmz_bytes = io.BytesIO()
+    try:
+        with zipfile.ZipFile(kmz_bytes, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("doc.kml", kml.kml())
+    except Exception as e:
+        st.error(f"Failed to build KMZ: {e}")
+        st.stop()
+
+    st.download_button(
+        label="Download KMZ",
+        data=kmz_bytes.getvalue(),
+        file_name="KMZ_Generator_Output.kmz",
+        mime="application/vnd.google-earth.kmz"
+    )
+    st.success("KMZ generated successfully.")
