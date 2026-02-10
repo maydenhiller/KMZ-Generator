@@ -10,9 +10,8 @@ st.title("KMZ Generator")
 st.write("Upload your Google Earth Seed File (.xlsx).")
 
 # ---------------------------------------------------------
-# Helpers
+# Constants and helpers
 # ---------------------------------------------------------
-
 KML_COLOR_MAP = {
     "red": "ff0000ff",
     "blue": "ffff0000",
@@ -60,30 +59,28 @@ def normalize_agm_name(raw_name):
 
 def set_icon_style(point, icon_value, is_note=False):
     v = safe_str(icon_value)
-
     if is_note:
         if v is None:
             return False
         v_lower = v.lower()
-
         if v_lower == "map note":
             try:
                 point.style.iconstyle.icon.href = MAP_NOTE_ICON
             except:
                 point.style.iconstyle.icon.href = MAP_NOTE_FALLBACK
             return True
-
         if v_lower == "red x":
-            point.style.iconstyle.icon.href = RED_X_ICON
+            try:
+                point.style.iconstyle.icon.href = RED_X_ICON
+            except:
+                pass
             return True
-
     if v:
         try:
             point.style.iconstyle.icon.href = str(v)
             return True
         except:
             return False
-
     return False
 
 def set_icon_color(point, color_value):
@@ -93,6 +90,9 @@ def set_icon_color(point, color_value):
     c_lower = c.lower()
     if c_lower in KML_COLOR_MAP:
         point.style.iconstyle.color = KML_COLOR_MAP[c_lower]
+    else:
+        if len(c) == 8 and all(ch in "0123456789abcdefABCDEF" for ch in c):
+            point.style.iconstyle.color = c
 
 def set_linestring_style(linestring, color_value):
     c = safe_str(color_value)
@@ -102,36 +102,45 @@ def set_linestring_style(linestring, color_value):
     if c_lower in KML_COLOR_MAP:
         linestring.style.linestyle.color = KML_COLOR_MAP[c_lower]
         linestring.style.linestyle.width = 3
+    else:
+        if len(c) == 8 and all(ch in "0123456789abcdefABCDEF" for ch in c):
+            linestring.style.linestyle.color = c
+            linestring.style.linestyle.width = 3
 
-def add_point(kml_folder, row, name_field="Name", icon_field="Icon",
-              color_field="IconColor", hide_label=False, format_agm=False, is_note=False):
-
+# Note: this function always sets the placemark name as a string
+def add_point(kml_folder, row, name_field="Name", icon_field="Icon", color_field="IconColor",
+              hide_label=False, format_agm=False, is_note=False):
     lat = row.get("Latitude")
     lon = row.get("Longitude")
     if pd.isna(lat) or pd.isna(lon):
-        return
+        return False
 
     try:
         lat_f = float(lat)
         lon_f = float(lon)
     except:
-        return
+        return False
 
     p = kml_folder.newpoint()
 
     raw_name = row.get(name_field)
     if format_agm:
-        p.name = normalize_agm_name(raw_name)
+        name_val = normalize_agm_name(raw_name)
     else:
-        p.name = safe_str(raw_name) or ""
+        name_val = safe_str(raw_name) or ""
+
+    # Ensure name is always a string (preserve leading zeros)
+    p.name = str(name_val)
 
     p.coords = [(lon_f, lat_f)]
 
-    set_icon_style(p, row.get(icon_field), is_note=is_note)
+    icon_set = set_icon_style(p, row.get(icon_field), is_note=is_note)
 
     if color_field:
         set_icon_color(p, row.get(color_field))
 
+    # Hide label until hover: tiny scale + fully transparent color
+    # This requires a valid icon href for Google Earth to show hover behavior reliably.
     try:
         if hide_label:
             p.style.labelstyle.scale = 0.01
@@ -142,7 +151,12 @@ def add_point(kml_folder, row, name_field="Name", icon_field="Icon",
     except:
         pass
 
+    return icon_set
+
 def add_multisegment_linestrings(kml_folder, df, color_column="LineStringColor"):
+    if df is None:
+        return False
+
     coords_segment = []
     created_any = False
 
@@ -154,9 +168,10 @@ def add_multisegment_linestrings(kml_folder, df, color_column="LineStringColor")
             if len(coords_segment) >= 2:
                 ls = kml_folder.newlinestring()
                 ls.coords = coords_segment
-                non_null = df[color_column].dropna().astype(str).str.strip()
-                if len(non_null) > 0:
-                    set_linestring_style(ls, non_null.iloc[0])
+                if color_column in df.columns:
+                    non_null = df[color_column].dropna().astype(str).str.strip()
+                    if len(non_null) > 0:
+                        set_linestring_style(ls, non_null.iloc[0])
                 created_any = True
             coords_segment = []
             continue
@@ -169,27 +184,34 @@ def add_multisegment_linestrings(kml_folder, df, color_column="LineStringColor")
     if len(coords_segment) >= 2:
         ls = kml_folder.newlinestring()
         ls.coords = coords_segment
-        non_null = df[color_column].dropna().astype(str).str.strip()
-        if len(non_null) > 0:
-            set_linestring_style(ls, non_null.iloc[0])
+        if color_column in df.columns:
+            non_null = df[color_column].dropna().astype(str).str.strip()
+            if len(non_null) > 0:
+                set_linestring_style(ls, non_null.iloc[0])
         created_any = True
 
     return created_any
 
 # ---------------------------------------------------------
-# UI
+# UI and file handling
 # ---------------------------------------------------------
-
 uploaded_xlsx = st.file_uploader("Upload Google Earth Seed File (.xlsx)", type=["xlsx"])
 
 if not uploaded_xlsx:
     st.stop()
 
-df_dict = pd.read_excel(uploaded_xlsx, sheet_name=None)
+try:
+    df_dict = pd.read_excel(uploaded_xlsx, sheet_name=None)
+except Exception as e:
+    st.error(f"Failed to read Excel file: {e}")
+    st.stop()
+
 normalized = {k.strip().upper(): v for k, v in df_dict.items()}
 
 def get_sheet(*names):
     for n in names:
+        if n is None:
+            continue
         key = n.strip().upper()
         df = normalized.get(key)
         if df is not None and not df.empty:
@@ -201,20 +223,37 @@ df_access = get_sheet("ACCESS")
 df_center = get_sheet("CENTERLINE")
 df_notes = get_sheet("NOTES")
 
+tab1, tab2, tab3, tab4 = st.tabs(["AGMs", "Access", "Centerline", "Notes"])
+
+with tab1:
+    st.subheader("AGMs")
+    st.dataframe(df_agms if df_agms is not None else pd.DataFrame())
+
+with tab2:
+    st.subheader("Access")
+    st.dataframe(df_access if df_access is not None else pd.DataFrame())
+
+with tab3:
+    st.subheader("Centerline")
+    st.dataframe(df_center if df_center is not None else pd.DataFrame())
+
+with tab4:
+    st.subheader("Notes")
+    st.dataframe(df_notes if df_notes is not None else pd.DataFrame())
+
 # ---------------------------------------------------------
 # Generate KMZ
 # ---------------------------------------------------------
-
 if st.button("Generate KMZ"):
     kml = simplekml.Kml()
 
-    # AGMs
+    # AGMs (format names per your rules)
     if df_agms is not None:
         folder = kml.newfolder(name="AGMs")
         for _, row in df_agms.iterrows():
             add_point(folder, row, format_agm=True)
 
-    # Access
+    # Access (multi-segment)
     if df_access is not None:
         folder = kml.newfolder(name="Access")
         created = add_multisegment_linestrings(folder, df_access)
@@ -222,7 +261,7 @@ if st.button("Generate KMZ"):
             for _, row in df_access.iterrows():
                 add_point(folder, row)
 
-    # Centerline (single)
+    # Centerline: single LineString using all non-empty coords in order (left unchanged)
     if df_center is not None:
         folder = kml.newfolder(name="Centerline")
         coords = []
@@ -238,11 +277,15 @@ if st.button("Generate KMZ"):
         if len(coords) >= 2:
             ls = folder.newlinestring()
             ls.coords = coords
-            non_null = df_center["LineStringColor"].dropna().astype(str).str.strip()
-            if len(non_null) > 0:
-                set_linestring_style(ls, non_null.iloc[0])
+            if "LineStringColor" in df_center.columns:
+                non_null = df_center["LineStringColor"].dropna().astype(str).str.strip()
+                if len(non_null) > 0:
+                    set_linestring_style(ls, non_null.iloc[0])
+        else:
+            for _, row in df_center.iterrows():
+                add_point(folder, row)
 
-    # Notes
+    # Notes: only change here — use keyword mapping and ensure names are strings and hidden until hover when requested
     if df_notes is not None:
         folder = kml.newfolder(name="Notes")
         hide_col = None
@@ -258,6 +301,7 @@ if st.button("Generate KMZ"):
                 if pd.notna(val) and str(val).strip().lower() in ("1", "true", "yes", "y", "t"):
                     hide_flag = True
 
+            # is_note=True triggers "Map Note" and "Red X" keyword handling
             add_point(folder, row,
                       name_field="Name",
                       icon_field="Icon",
@@ -266,9 +310,14 @@ if st.button("Generate KMZ"):
                       format_agm=False,
                       is_note=True)
 
+    # Package KMZ
     kmz_bytes = io.BytesIO()
-    with zipfile.ZipFile(kmz_bytes, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("doc.kml", kml.kml())
+    try:
+        with zipfile.ZipFile(kmz_bytes, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("doc.kml", kml.kml())
+    except Exception as e:
+        st.error(f"Failed to build KMZ: {e}")
+        st.stop()
 
     st.download_button(
         label="Download KMZ",
@@ -276,3 +325,4 @@ if st.button("Generate KMZ"):
         file_name="KMZ_Generator_Output.kmz",
         mime="application/vnd.google-earth.kmz"
     )
+    st.success("KMZ generated successfully.")
