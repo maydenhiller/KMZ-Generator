@@ -9,9 +9,9 @@ st.set_page_config(page_title="KMZ Generator", layout="wide")
 st.title("KMZ Generator")
 st.write("Upload your Google Earth Seed File (.xlsx).")
 
-# ---------------------------------------------------------
+# -------------------------
 # Constants and helpers
-# ---------------------------------------------------------
+# -------------------------
 KML_COLOR_MAP = {
     "red": "ff0000ff",
     "blue": "ffff0000",
@@ -37,14 +37,17 @@ def normalize_agm_name(raw_name):
     s = safe_str(raw_name)
     if s is None:
         return ""
+    # preserve explicit leading zeros
     if re.fullmatch(r"0+\d+", s):
         return s
+    # pure digits without leading zeros
     if re.fullmatch(r"\d+", s):
         if len(s) >= 4:
             return s
         if len(s) < 3:
             return s.zfill(3)
         return s
+    # numeric-like (10.0)
     try:
         f = float(s)
         if f.is_integer():
@@ -107,7 +110,7 @@ def set_linestring_style(linestring, color_value):
             linestring.style.linestyle.color = c
             linestring.style.linestyle.width = 3
 
-# Note: this function always sets the placemark name as a string
+# Always set name as string; return whether icon href was set
 def add_point(kml_folder, row, name_field="Name", icon_field="Icon", color_field="IconColor",
               hide_label=False, format_agm=False, is_note=False):
     lat = row.get("Latitude")
@@ -132,6 +135,15 @@ def add_point(kml_folder, row, name_field="Name", icon_field="Icon", color_field
     # Ensure name is always a string (preserve leading zeros)
     p.name = str(name_val)
 
+    # Also set description and balloon text so clicking always shows the name
+    p.description = str(name_val)
+    try:
+        # BalloonStyle text: show the name (use $[name] token)
+        p.style.balloonstyle.text = "<![CDATA[$[name]]]>"
+    except:
+        # ignore if simplekml doesn't accept
+        pass
+
     p.coords = [(lon_f, lat_f)]
 
     icon_set = set_icon_style(p, row.get(icon_field), is_note=is_note)
@@ -139,10 +151,10 @@ def add_point(kml_folder, row, name_field="Name", icon_field="Icon", color_field
     if color_field:
         set_icon_color(p, row.get(color_field))
 
-    # Hide label until hover: tiny scale + fully transparent color
-    # This requires a valid icon href for Google Earth to show hover behavior reliably.
+    # Label hiding: tiny scale + fully transparent color so label appears on hover/click
+    # Only apply the hide trick if an icon href was set (Google Earth hover behavior is inconsistent otherwise)
     try:
-        if hide_label:
+        if hide_label and icon_set:
             p.style.labelstyle.scale = 0.01
             p.style.labelstyle.color = "00ffffff"
         else:
@@ -192,9 +204,9 @@ def add_multisegment_linestrings(kml_folder, df, color_column="LineStringColor")
 
     return created_any
 
-# ---------------------------------------------------------
+# -------------------------
 # UI and file handling
-# ---------------------------------------------------------
+# -------------------------
 uploaded_xlsx = st.file_uploader("Upload Google Earth Seed File (.xlsx)", type=["xlsx"])
 
 if not uploaded_xlsx:
@@ -241,9 +253,9 @@ with tab4:
     st.subheader("Notes")
     st.dataframe(df_notes if df_notes is not None else pd.DataFrame())
 
-# ---------------------------------------------------------
+# -------------------------
 # Generate KMZ
-# ---------------------------------------------------------
+# -------------------------
 if st.button("Generate KMZ"):
     kml = simplekml.Kml()
 
@@ -261,19 +273,27 @@ if st.button("Generate KMZ"):
             for _, row in df_access.iterrows():
                 add_point(folder, row)
 
-    # Centerline: single LineString using all non-empty coords in order (left unchanged)
+    # Centerline: single LineString using all non-empty coords in order
+    # Fix: remove consecutive duplicate coordinates to avoid accidental loops
     if df_center is not None:
         folder = kml.newfolder(name="Centerline")
         coords = []
+        prev = None
         for _, row in df_center.iterrows():
             lat = row.get("Latitude")
             lon = row.get("Longitude")
             if pd.isna(lat) or pd.isna(lon):
                 continue
             try:
-                coords.append((float(lon), float(lat)))
+                pt = (float(lon), float(lat))
             except:
                 continue
+            # skip consecutive duplicates
+            if prev is not None and pt == prev:
+                continue
+            coords.append(pt)
+            prev = pt
+
         if len(coords) >= 2:
             ls = folder.newlinestring()
             ls.coords = coords
@@ -282,6 +302,7 @@ if st.button("Generate KMZ"):
                 if len(non_null) > 0:
                     set_linestring_style(ls, non_null.iloc[0])
         else:
+            # fallback to points if not enough coords
             for _, row in df_center.iterrows():
                 add_point(folder, row)
 
