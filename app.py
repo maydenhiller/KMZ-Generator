@@ -7,7 +7,7 @@ import re
 
 st.set_page_config(page_title="KMZ Generator", layout="wide")
 st.title("KMZ Generator")
-st.write("Upload your Google Earth Seed File (.xlsx). Debug info for Notes is shown below before packaging.")
+st.write("Upload your Google Earth Seed File (.xlsx). This version uses StyleMaps so Notes reveal on hover.")
 
 # -------------------------
 # Constants and helpers
@@ -68,23 +68,6 @@ def choose_note_icon_href(icon_value):
         return RED_X_ICON
     return v  # use exactly what user provided
 
-def set_icon_style_from_href(point, href):
-    if not href:
-        return False
-    try:
-        point.style.iconstyle.icon.href = str(href)
-        try:
-            point.style.iconstyle.scale = 1
-        except:
-            pass
-        return True
-    except:
-        try:
-            point.style.iconstyle.icon.href = str(href)
-            return True
-        except:
-            return False
-
 def set_icon_color(point, color_value):
     c = safe_str(color_value)
     if not c:
@@ -110,10 +93,13 @@ def set_linestring_style(linestring, color_value):
             linestring.style.linestyle.width = 3
 
 # -------------------------
-# Add placemark and return debug info
+# Add placemark with StyleMap support and return debug info
 # -------------------------
-def add_point_with_debug(kml_folder, row, name_field="Name", icon_field="Icon",
-                         color_field="IconColor", hide_label=False, format_agm=False, is_note=False):
+def add_note_placemark(kml, folder, row, stylemap_registry, hide_label=False):
+    """
+    stylemap_registry: dict href -> stylemap_id (and stores created styles)
+    Returns debug dict for UI.
+    """
     lat = row.get("Latitude")
     lon = row.get("Longitude")
     if pd.isna(lat) or pd.isna(lon):
@@ -125,68 +111,149 @@ def add_point_with_debug(kml_folder, row, name_field="Name", icon_field="Icon",
     except:
         return None
 
-    p = kml_folder.newpoint()
+    # name as string
+    name_val = safe_str(row.get("Name")) or ""
+    name_str = str(name_val)
 
+    # determine icon href (keyword mapping)
+    href = choose_note_icon_href(row.get("Icon"))
+
+    # create or reuse stylemap for this href
+    stylemap_id = None
+    icon_set = False
+    if href:
+        # ensure fallback for MAP_NOTE_ICON if unreachable is not handled here; we set href directly
+        # stylemap key is the href string
+        key = href
+        if key not in stylemap_registry:
+            # create normal style
+            normal = kml.newstyle()
+            try:
+                normal.iconstyle.icon.href = key
+            except:
+                # fallback to MAP_NOTE_FALLBACK if setting fails
+                try:
+                    normal.iconstyle.icon.href = MAP_NOTE_FALLBACK
+                except:
+                    pass
+            # normal: tiny transparent label
+            try:
+                normal.labelstyle.scale = 0.01
+                normal.labelstyle.color = "00ffffff"
+            except:
+                pass
+
+            # create highlight style
+            highlight = kml.newstyle()
+            try:
+                highlight.iconstyle.icon.href = key
+            except:
+                try:
+                    highlight.iconstyle.icon.href = MAP_NOTE_FALLBACK
+                except:
+                    pass
+            # highlight: visible label
+            try:
+                highlight.labelstyle.scale = 1
+                highlight.labelstyle.color = "ffffffff"
+            except:
+                pass
+
+            # create stylemap
+            sm = kml.newstylemap()
+            sm.normalstyle = normal
+            sm.highlightstyle = highlight
+            # assign an id for reference
+            sm_id = f"sm_{len(stylemap_registry)+1}"
+            sm.id = sm_id
+            stylemap_registry[key] = {"id": sm_id, "normal": normal, "highlight": highlight}
+        stylemap_id = stylemap_registry[key]["id"]
+        icon_set = True
+    else:
+        # no href: create a simple placemark without stylemap; label visible or not per hide_label
+        icon_set = False
+
+    # create placemark
+    p = folder.newpoint()
+    p.name = name_str
+    p.description = name_str
+    try:
+        p.style.balloonstyle.text = "<![CDATA[$[name]]]>"
+    except:
+        pass
+    p.coords = [(lon_f, lat_f)]
+
+    # If we have a stylemap, assign styleurl
+    if stylemap_id:
+        p.styleurl = f"#{stylemap_id}"
+    else:
+        # no stylemap: set icon href directly if provided in sheet (non-keyword)
+        v = safe_str(row.get("Icon"))
+        if v:
+            try:
+                p.style.iconstyle.icon.href = str(v)
+                icon_set = True
+            except:
+                icon_set = False
+        # label handling when no stylemap
+        try:
+            if hide_label and icon_set:
+                p.style.labelstyle.scale = 0.01
+                p.style.labelstyle.color = "00ffffff"
+            else:
+                p.style.labelstyle.scale = 1
+                p.style.labelstyle.color = "ffffffff"
+        except:
+            pass
+
+    # return debug info
+    debug = {
+        "Name": name_str,
+        "IconHref": href or (safe_str(row.get("Icon")) or ""),
+        "IconSet": bool(icon_set),
+        "HideFlag": bool(hide_label),
+        "StyleMapId": stylemap_id or "",
+        "LabelStyleNormal": "scale=0.01;color=00ffffff" if stylemap_id else (f"scale={getattr(p.style.labelstyle,'scale',1)};color={getattr(p.style.labelstyle,'color','ffffffff')}"),
+        "LabelStyleHighlight": "scale=1;color=ffffffff" if stylemap_id else ""
+    }
+    return debug
+
+# Generic point for AGMs and others (unchanged behavior)
+def add_point_simple(folder, row, name_field="Name", icon_field="Icon", color_field="IconColor", format_agm=False):
+    lat = row.get("Latitude")
+    lon = row.get("Longitude")
+    if pd.isna(lat) or pd.isna(lon):
+        return False
+    try:
+        lat_f = float(lat)
+        lon_f = float(lon)
+    except:
+        return False
+
+    p = folder.newpoint()
     raw_name = row.get(name_field)
     if format_agm:
         name_val = normalize_agm_name(raw_name)
     else:
         name_val = safe_str(raw_name) or ""
-
-    # Ensure name is always a string
-    name_str = str(name_val)
-    p.name = name_str
-    p.description = name_str
+    p.name = str(name_val)
+    p.description = str(name_val)
     try:
         p.style.balloonstyle.text = "<![CDATA[$[name]]]>"
-
     except:
         pass
-
     p.coords = [(lon_f, lat_f)]
 
-    # Determine icon href (for notes use keyword mapping)
-    href = None
-    if is_note:
-        href = choose_note_icon_href(row.get(icon_field))
-    else:
-        href = safe_str(row.get(icon_field))
-
-    icon_set = set_icon_style_from_href(p, href)
-
-    if color_field:
-        set_icon_color(p, row.get(color_field))
-
-    # Apply hide-until-hover only if icon href was set
-    label_scale = 1
-    label_color = "ffffffff"
-    if hide_label and icon_set:
+    v = safe_str(row.get(icon_field))
+    if v:
         try:
-            p.style.labelstyle.scale = 0.01
-            p.style.labelstyle.color = "00ffffff"
-            label_scale = 0.01
-            label_color = "00ffffff"
-        except:
-            try:
-                p.style.labelstyle.scale = 1
-                p.style.labelstyle.color = "ffffffff"
-            except:
-                pass
-    else:
-        try:
-            p.style.labelstyle.scale = 1
-            p.style.labelstyle.color = "ffffffff"
+            p.style.iconstyle.icon.href = str(v)
         except:
             pass
 
-    debug = {
-        "Name": name_str,
-        "IconHref": href if href is not None else "",
-        "IconSet": bool(icon_set),
-        "HideFlag": bool(hide_label),
-        "LabelStyle": f"scale={label_scale};color={label_color}"
-    }
-    return debug
+    if color_field:
+        set_icon_color(p, row.get(color_field))
+    return True
 
 # -------------------------
 # Line helpers
@@ -194,14 +261,11 @@ def add_point_with_debug(kml_folder, row, name_field="Name", icon_field="Icon",
 def add_multisegment_linestrings(kml_folder, df, color_column="LineStringColor"):
     if df is None:
         return False
-
     coords_segment = []
     created_any = False
-
     for _, row in df.iterrows():
         lat = row.get("Latitude")
         lon = row.get("Longitude")
-
         if pd.isna(lat) or pd.isna(lon):
             if len(coords_segment) >= 2:
                 ls = kml_folder.newlinestring()
@@ -213,12 +277,10 @@ def add_multisegment_linestrings(kml_folder, df, color_column="LineStringColor")
                 created_any = True
             coords_segment = []
             continue
-
         try:
             coords_segment.append((float(lon), float(lat)))
         except:
             continue
-
     if len(coords_segment) >= 2:
         ls = kml_folder.newlinestring()
         ls.coords = coords_segment
@@ -227,7 +289,6 @@ def add_multisegment_linestrings(kml_folder, df, color_column="LineStringColor")
             if len(non_null) > 0:
                 set_linestring_style(ls, non_null.iloc[0])
         created_any = True
-
     return created_any
 
 # -------------------------
@@ -279,7 +340,6 @@ with tab4:
     st.subheader("Notes")
     st.dataframe(df_notes if df_notes is not None else pd.DataFrame())
 
-# Debug toggle
 debug_mode = st.checkbox("Show Notes debug table before packaging", value=True)
 
 # -------------------------
@@ -287,14 +347,14 @@ debug_mode = st.checkbox("Show Notes debug table before packaging", value=True)
 # -------------------------
 if st.button("Generate KMZ"):
     kml = simplekml.Kml()
+    stylemap_registry = {}  # href -> {id, normal, highlight}
     notes_debug_rows = []
 
-    # AGMs (format names per your rules)
+    # AGMs (unchanged formatting rules)
     if df_agms is not None:
         folder = kml.newfolder(name="AGMs")
         for _, row in df_agms.iterrows():
-            # reuse add_point_with_debug but ignore debug output
-            add_point_with_debug(folder, row, format_agm=True, is_note=False)
+            add_point_simple(folder, row, format_agm=True)
 
     # Access (multi-segment)
     if df_access is not None:
@@ -302,7 +362,7 @@ if st.button("Generate KMZ"):
         created = add_multisegment_linestrings(folder, df_access)
         if not created:
             for _, row in df_access.iterrows():
-                add_point_with_debug(folder, row, is_note=False)
+                add_point_simple(folder, row)
 
     # Centerline: single LineString using all non-empty coords in order
     # Remove consecutive duplicates and ensure not closing loop by dropping final if equal to first
@@ -324,7 +384,7 @@ if st.button("Generate KMZ"):
             coords.append(pt)
             prev = pt
 
-        # If first == last, drop last to avoid closed loop
+        # if first == last, drop last to avoid closed loop
         if len(coords) >= 2 and coords[0] == coords[-1]:
             coords = coords[:-1]
 
@@ -337,9 +397,9 @@ if st.button("Generate KMZ"):
                     set_linestring_style(ls, non_null.iloc[0])
         else:
             for _, row in df_center.iterrows():
-                add_point_with_debug(folder, row, is_note=False)
+                add_point_simple(folder, row)
 
-    # Notes: build placemarks and collect debug info
+    # Notes: only changed area — create StyleMaps per icon href so hover shows label
     if df_notes is not None:
         folder = kml.newfolder(name="Notes")
         hide_col = None
@@ -355,13 +415,7 @@ if st.button("Generate KMZ"):
                 if pd.notna(val) and str(val).strip().lower() in ("1", "true", "yes", "y", "t"):
                     hide_flag = True
 
-            dbg = add_point_with_debug(folder, row,
-                                       name_field="Name",
-                                       icon_field="Icon",
-                                       color_field=None,
-                                       hide_label=hide_flag,
-                                       format_agm=False,
-                                       is_note=True)
+            dbg = add_note_placemark(kml, folder, row, stylemap_registry, hide_label=hide_flag)
             if dbg:
                 notes_debug_rows.append(dbg)
 
@@ -369,8 +423,8 @@ if st.button("Generate KMZ"):
     if debug_mode:
         if notes_debug_rows:
             df_dbg = pd.DataFrame(notes_debug_rows)
-            st.subheader("Notes debug output")
-            st.write("Confirm these values match what you expect. If a placemark shows an X in Google Earth, check IconHref and IconSet.")
+            st.subheader("Notes debug output (what will be written into KML)")
+            st.write("IconHref must be a valid image URL for the icon to display. StyleMapId shows which StyleMap was created.")
             st.dataframe(df_dbg)
         else:
             st.info("No Notes placemarks found or no debug rows generated.")
