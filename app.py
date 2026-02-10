@@ -1,460 +1,1050 @@
-# app.py
-import streamlit as st
-import pandas as pd
-import zipfile
-import io
-import simplekml
-import re
-import xml.etree.ElementTree as ET
-
-st.set_page_config(page_title="KMZ Generator", layout="wide")
-st.title("KMZ Generator")
-st.write("Upload your Google Earth Seed File (.xlsx). This version injects StyleMaps so Notes reveal on hover.")
-
-# -------------------------
-# Constants and helpers
-# -------------------------
-KML_NS = "http://www.opengis.net/kml/2.2"
-ET.register_namespace("", KML_NS)
-Q = lambda tag: "{%s}%s" % (KML_NS, tag)
-
-KML_COLOR_MAP = {
-    "red": "ff0000ff",
-    "blue": "ffff0000",
-    "yellow": "ff00ffff",
-    "purple": "ff800080",
-    "green": "ff00ff00",
-    "orange": "ff008cff",
-    "white": "ffffffff",
-    "black": "ff000000"
-}
-
-MAP_NOTE_ICON = "http://www.earthpoint.us/Dots/GoogleEarth/pal3/icon62.png"
-MAP_NOTE_FALLBACK = "https://maps.google.com/mapfiles/kml/pal3/icon54.png"
-RED_X_ICON = "http://maps.google.com/mapfiles/kml/pal3/icon56.png"
-
-def safe_str(val):
-    if pd.isna(val):
-        return None
-    s = str(val).strip()
-    return s if s != "" else None
-
-def normalize_agm_name(raw_name):
-    s = safe_str(raw_name)
-    if s is None:
-        return ""
-    if re.fullmatch(r"0+\d+", s):
-        return s
-    if re.fullmatch(r"\d+", s):
-        if len(s) >= 4:
-            return s
-        if len(s) < 3:
-            return s.zfill(3)
-        return s
-    try:
-        f = float(s)
-        if f.is_integer():
-            i = int(f)
-            s_digits = str(i)
-            if len(s_digits) < 3:
-                return s_digits.zfill(3)
-            return s_digits
-    except:
-        pass
-    return s
-
-def choose_note_icon_href(icon_value):
-    v = safe_str(icon_value)
-    if v is None:
-        return None
-    vl = v.lower()
-    if vl == "map note":
-        return MAP_NOTE_ICON
-    if vl == "red x":
-        return RED_X_ICON
-    return v
-
-def set_icon_color(point, color_value):
-    c = safe_str(color_value)
-    if not c:
-        return
-    c_lower = c.lower()
-    if c_lower in KML_COLOR_MAP:
-        point.style.iconstyle.color = KML_COLOR_MAP[c_lower]
-    else:
-        if len(c) == 8 and all(ch in "0123456789abcdefABCDEF" for ch in c):
-            point.style.iconstyle.color = c
-
-def set_linestring_style(linestring, color_value):
-    c = safe_str(color_value)
-    if not c:
-        return
-    c_lower = c.lower()
-    if c_lower in KML_COLOR_MAP:
-        linestring.style.linestyle.color = KML_COLOR_MAP[c_lower]
-        linestring.style.linestyle.width = 3
-    else:
-        if len(c) == 8 and all(ch in "0123456789abcdefABCDEF" for ch in c):
-            linestring.style.linestyle.color = c
-            linestring.style.linestyle.width = 3
-
-# -------------------------
-# Line helpers
-# -------------------------
-def add_multisegment_linestrings(kml_folder, df, color_column="LineStringColor"):
-    if df is None:
-        return False
-    coords_segment = []
-    created_any = False
-    for _, row in df.iterrows():
-        lat = row.get("Latitude")
-        lon = row.get("Longitude")
-        if pd.isna(lat) or pd.isna(lon):
-            if len(coords_segment) >= 2:
-                ls = kml_folder.newlinestring()
-                ls.coords = coords_segment
-                if color_column in df.columns:
-                    non_null = df[color_column].dropna().astype(str).str.strip()
-                    if len(non_null) > 0:
-                        set_linestring_style(ls, non_null.iloc[0])
-                created_any = True
-            coords_segment = []
-            continue
-        try:
-            coords_segment.append((float(lon), float(lat)))
-        except:
-            continue
-    if len(coords_segment) >= 2:
-        ls = kml_folder.newlinestring()
-        ls.coords = coords_segment
-        if color_column in df.columns:
-            non_null = df[color_column].dropna().astype(str).str.strip()
-            if len(non_null) > 0:
-                set_linestring_style(ls, non_null.iloc[0])
-        created_any = True
-    return created_any
-
-# -------------------------
-# Placemark creators
-# -------------------------
-def add_point_simple(folder, row, name_field="Name", icon_field="Icon", color_field="IconColor", format_agm=False):
-    lat = row.get("Latitude")
-    lon = row.get("Longitude")
-    if pd.isna(lat) or pd.isna(lon):
-        return False
-    try:
-        lat_f = float(lat)
-        lon_f = float(lon)
-    except:
-        return False
-    p = folder.newpoint()
-    raw_name = row.get(name_field)
-    if format_agm:
-        name_val = normalize_agm_name(raw_name)
-    else:
-        name_val = safe_str(raw_name) or ""
-    p.name = str(name_val)
-    p.description = str(name_val)
-    try:
-        p.style.balloonstyle.text = "<![CDATA[$[name]]]>"
-
-    except:
-        pass
-    p.coords = [(lon_f, lat_f)]
-    v = safe_str(row.get(icon_field))
-    if v:
-        try:
-            p.style.iconstyle.icon.href = str(v)
-        except:
-            pass
-    if color_field:
-        set_icon_color(p, row.get(color_field))
-    return True
-
-def add_note_simple(folder, row, name_field="Name", icon_field="Icon", hide_label=False):
-    lat = row.get("Latitude")
-    lon = row.get("Longitude")
-    if pd.isna(lat) or pd.isna(lon):
-        return ""
-    try:
-        lat_f = float(lat)
-        lon_f = float(lon)
-    except:
-        return ""
-    p = folder.newpoint()
-    name_val = safe_str(row.get(name_field)) or ""
-    name_str = str(name_val)
-    p.name = name_str
-    p.description = name_str
-    try:
-        p.style.balloonstyle.text = "<![CDATA[$[name]]]>"
-
-    except:
-        pass
-    p.coords = [(lon_f, lat_f)]
-    href = choose_note_icon_href(row.get(icon_field))
-    if href:
-        try:
-            p.style.iconstyle.icon.href = str(href)
-        except:
-            try:
-                p.style.iconstyle.icon.href = MAP_NOTE_FALLBACK
-            except:
-                pass
-    try:
-        if hide_label:
-            p.style.labelstyle.scale = 0.01
-            p.style.labelstyle.color = "00ffffff"
-        else:
-            p.style.labelstyle.scale = 1
-            p.style.labelstyle.color = "ffffffff"
-    except:
-        pass
-    return href or safe_str(row.get(icon_field)) or ""
-
-# -------------------------
-# Post-process KML using ElementTree (no external deps)
-# -------------------------
-def inject_stylemaps_into_kml_bytes(kml_bytes):
-    # parse
-    root = ET.fromstring(kml_bytes)
-    # find Document
-    doc = root.find(".//" + Q("Document"))
-    if doc is None:
-        if root.tag == Q("Document"):
-            doc = root
-        else:
-            return kml_bytes
-    # find Notes folder
-    notes_folder = None
-    for folder in doc.findall(Q("Folder")):
-        name_el = folder.find(Q("name"))
-        if name_el is not None and name_el.text and name_el.text.strip().lower() == "notes":
-            notes_folder = folder
-            break
-    if notes_folder is None:
-        return kml_bytes
-    # collect unique hrefs
-    hrefs = []
-    for pm in notes_folder.findall(Q("Placemark")):
-        icon_href_el = pm.find(".//" + Q("Icon") + "/" + Q("href"))
-        if icon_href_el is not None and icon_href_el.text:
-            href = icon_href_el.text.strip()
-            if href not in hrefs:
-                hrefs.append(href)
-    # create styles and stylemaps
-    href_to_sm = {}
-    for i, href in enumerate(hrefs, start=1):
-        sm_id = f"sm_{i}"
-        # Normal style
-        style_normal = ET.Element(Q("Style"))
-        style_normal.set("id", f"{sm_id}_normal")
-        iconstyle = ET.SubElement(style_normal, Q("IconStyle"))
-        icon = ET.SubElement(iconstyle, Q("Icon"))
-        href_el = ET.SubElement(icon, Q("href"))
-        href_el.text = href
-        label = ET.SubElement(style_normal, Q("LabelStyle"))
-        scale = ET.SubElement(label, Q("scale"))
-        scale.text = "0.01"
-        color = ET.SubElement(label, Q("color"))
-        color.text = "00ffffff"
-        # Highlight style
-        style_high = ET.Element(Q("Style"))
-        style_high.set("id", f"{sm_id}_highlight")
-        iconstyle_h = ET.SubElement(style_high, Q("IconStyle"))
-        icon_h = ET.SubElement(iconstyle_h, Q("Icon"))
-        href_h = ET.SubElement(icon_h, Q("href"))
-        href_h.text = href
-        label_h = ET.SubElement(style_high, Q("LabelStyle"))
-        scale_h = ET.SubElement(label_h, Q("scale"))
-        scale_h.text = "1"
-        color_h = ET.SubElement(label_h, Q("color"))
-        color_h.text = "ffffffff"
-        # StyleMap
-        stylemap = ET.Element(Q("StyleMap"))
-        stylemap.set("id", sm_id)
-        pair_n = ET.SubElement(stylemap, Q("Pair"))
-        key_n = ET.SubElement(pair_n, Q("key"))
-        key_n.text = "normal"
-        styleurl_n = ET.SubElement(pair_n, Q("styleUrl"))
-        styleurl_n.text = f"#{sm_id}_normal"
-        pair_h = ET.SubElement(stylemap, Q("Pair"))
-        key_h = ET.SubElement(pair_h, Q("key"))
-        key_h.text = "highlight"
-        styleurl_h = ET.SubElement(pair_h, Q("styleUrl"))
-        styleurl_h.text = f"#{sm_id}_highlight"
-        # append to Document
-        doc.append(style_normal)
-        doc.append(style_high)
-        doc.append(stylemap)
-        href_to_sm[href] = sm_id
-    # assign styleUrl to placemarks in Notes
-    for pm in notes_folder.findall(Q("Placemark")):
-        icon_href_el = pm.find(".//" + Q("Icon") + "/" + Q("href"))
-        if icon_href_el is not None and icon_href_el.text:
-            href = icon_href_el.text.strip()
-            smid = href_to_sm.get(href)
-            if smid:
-                # remove existing styleUrl children
-                for existing in pm.findall(Q("styleUrl")):
-                    pm.remove(existing)
-                styleurl_el = ET.SubElement(pm, Q("styleUrl"))
-                styleurl_el.text = f"#{smid}"
-    # return bytes
-    out = ET.tostring(root, encoding="utf-8", xml_declaration=True)
-    return out
-
-# -------------------------
-# UI and file handling
-# -------------------------
-uploaded_xlsx = st.file_uploader("Upload Google Earth Seed File (.xlsx)", type=["xlsx"])
-if not uploaded_xlsx:
-    st.stop()
-
-try:
-    df_dict = pd.read_excel(uploaded_xlsx, sheet_name=None)
-except Exception as e:
-    st.error(f"Failed to read Excel file: {e}")
-    st.stop()
-
-normalized = {k.strip().upper(): v for k, v in df_dict.items()}
-
-def get_sheet(*names):
-    for n in names:
-        if n is None:
-            continue
-        key = n.strip().upper()
-        df = normalized.get(key)
-        if df is not None and not df.empty:
-            return df
-    return None
-
-df_agms = get_sheet("AGMS", "AGM")
-df_access = get_sheet("ACCESS")
-df_center = get_sheet("CENTERLINE")
-df_notes = get_sheet("NOTES")
-
-tab1, tab2, tab3, tab4 = st.tabs(["AGMs", "Access", "Centerline", "Notes"])
-with tab1:
-    st.subheader("AGMs")
-    st.dataframe(df_agms if df_agms is not None else pd.DataFrame())
-with tab2:
-    st.subheader("Access")
-    st.dataframe(df_access if df_access is not None else pd.DataFrame())
-with tab3:
-    st.subheader("Centerline")
-    st.dataframe(df_center if df_center is not None else pd.DataFrame())
-with tab4:
-    st.subheader("Notes")
-    st.dataframe(df_notes if df_notes is not None else pd.DataFrame())
-
-debug_mode = st.checkbox("Show Notes debug table before packaging", value=True)
-
-# -------------------------
-# Generate KMZ
-# -------------------------
-if st.button("Generate KMZ"):
-    kml = simplekml.Kml()
-    notes_debug_rows = []
-
-    # AGMs
-    if df_agms is not None:
-        folder = kml.newfolder(name="AGMs")
-        for _, row in df_agms.iterrows():
-            add_point_simple(folder, row, format_agm=True)
-
-    # Access
-    if df_access is not None:
-        folder = kml.newfolder(name="Access")
-        created = add_multisegment_linestrings(folder, df_access)
-        if not created:
-            for _, row in df_access.iterrows():
-                add_point_simple(folder, row)
-
-    # Centerline: single LineString using all non-empty coords in order
-    # Remove consecutive duplicates and avoid closing loop by dropping final if equal to first
-    if df_center is not None:
-        folder = kml.newfolder(name="Centerline")
-        coords = []
-        prev = None
-        for _, row in df_center.iterrows():
-            lat = row.get("Latitude")
-            lon = row.get("Longitude")
-            if pd.isna(lat) or pd.isna(lon):
-                continue
-            try:
-                pt = (float(lon), float(lat))
-            except:
-                continue
-            if prev is not None and pt == prev:
-                continue
-            coords.append(pt)
-            prev = pt
-        if len(coords) >= 2 and coords[0] == coords[-1]:
-            coords = coords[:-1]
-        if len(coords) >= 2:
-            ls = kml.newlinestring()
-            ls.coords = coords
-            if "LineStringColor" in df_center.columns:
-                non_null = df_center["LineStringColor"].dropna().astype(str).str.strip()
-                if len(non_null) > 0:
-                    set_linestring_style(ls, non_null.iloc[0])
-        else:
-            for _, row in df_center.iterrows():
-                add_point_simple(folder, row)
-
-    # Notes: create placemarks and collect debug info
-    if df_notes is not None:
-        folder = kml.newfolder(name="Notes")
-        hide_col = None
-        for col in df_notes.columns:
-            if col.strip().upper() == "HIDENAMEUNTILMOUSEOVER":
-                hide_col = col
-                break
-        for _, row in df_notes.iterrows():
-            hide_flag = False
-            if hide_col:
-                val = row.get(hide_col)
-                if pd.notna(val) and str(val).strip().lower() in ("1", "true", "yes", "y", "t"):
-                    hide_flag = True
-            href = add_note_simple(folder, row, hide_label=hide_flag)
-            notes_debug_rows.append({
-                "Name": str(safe_str(row.get("Name")) or ""),
-                "IconHref": href or "",
-                "HideFlag": bool(hide_flag)
-            })
-
-    # Show debug table if requested
-    if debug_mode:
-        if notes_debug_rows:
-            df_dbg = pd.DataFrame(notes_debug_rows)
-            st.subheader("Notes debug output (what will be written into KML)")
-            st.write("Confirm IconHref values. If IconHref is empty, no icon will be set for that placemark.")
-            st.dataframe(df_dbg)
-        else:
-            st.info("No Notes placemarks found or no debug rows generated.")
-
-    # Build KML bytes, then inject StyleMaps
-    try:
-        raw_kml = kml.kml().encode("utf-8")
-        modified_kml = inject_stylemaps_into_kml_bytes(raw_kml)
-    except Exception as e:
-        st.error(f"Failed to build or modify KML: {e}")
-        st.stop()
-
-    # Package KMZ
-    kmz_bytes = io.BytesIO()
-    try:
-        with zipfile.ZipFile(kmz_bytes, "w", zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr("doc.kml", modified_kml)
-    except Exception as e:
-        st.error(f"Failed to build KMZ: {e}")
-        st.stop()
-
-    st.download_button(
-        label="Download KMZ",
-        data=kmz_bytes.getvalue(),
-        file_name="KMZ_Generator_Output.kmz",
-        mime="application/vnd.google-earth.kmz"
-    )
-    st.success("KMZ generated successfully.")
+<?xml version='1.0' encoding='utf-8'?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+    <Document id="8112">
+        <Style id="8272">
+            <LineStyle id="8273">
+                <color>ff0000ff</color>
+                <colorMode>normal</colorMode>
+                <width>3</width>
+            </LineStyle>
+        </Style>
+        <Folder id="8113">
+            <Style id="8116">
+                <IconStyle id="8118">
+                    <color>ff800080</color>
+                    <colorMode>normal</colorMode>
+                    <scale>1</scale>
+                    <heading>0</heading>
+                    <Icon id="8119">
+                        <href>http://maps.google.com/mapfiles/kml/shapes/triangle.png</href>
+                    </Icon>
+                </IconStyle>
+                <BalloonStyle>
+                    <text>$[name]</text>
+                    <displayMode>default</displayMode>
+                </BalloonStyle>
+            </Style>
+            <Style id="8122">
+                <IconStyle id="8124">
+                    <color>ff0000ff</color>
+                    <colorMode>normal</colorMode>
+                    <scale>1</scale>
+                    <heading>0</heading>
+                    <Icon id="8125">
+                        <href>http://maps.google.com/mapfiles/kml/shapes/flag.png</href>
+                    </Icon>
+                </IconStyle>
+                <BalloonStyle>
+                    <text>$[name]</text>
+                    <displayMode>default</displayMode>
+                </BalloonStyle>
+            </Style>
+            <Style id="8128">
+                <IconStyle id="8130">
+                    <color>ff0000ff</color>
+                    <colorMode>normal</colorMode>
+                    <scale>1</scale>
+                    <heading>0</heading>
+                    <Icon id="8131">
+                        <href>http://maps.google.com/mapfiles/kml/shapes/flag.png</href>
+                    </Icon>
+                </IconStyle>
+                <BalloonStyle>
+                    <text>$[name]</text>
+                    <displayMode>default</displayMode>
+                </BalloonStyle>
+            </Style>
+            <Style id="8134">
+                <IconStyle id="8136">
+                    <color>ff0000ff</color>
+                    <colorMode>normal</colorMode>
+                    <scale>1</scale>
+                    <heading>0</heading>
+                    <Icon id="8137">
+                        <href>http://maps.google.com/mapfiles/kml/shapes/flag.png</href>
+                    </Icon>
+                </IconStyle>
+                <BalloonStyle>
+                    <text>$[name]</text>
+                    <displayMode>default</displayMode>
+                </BalloonStyle>
+            </Style>
+            <Style id="8140">
+                <IconStyle id="8142">
+                    <color>ff0000ff</color>
+                    <colorMode>normal</colorMode>
+                    <scale>1</scale>
+                    <heading>0</heading>
+                    <Icon id="8143">
+                        <href>http://maps.google.com/mapfiles/kml/shapes/flag.png</href>
+                    </Icon>
+                </IconStyle>
+                <BalloonStyle>
+                    <text>$[name]</text>
+                    <displayMode>default</displayMode>
+                </BalloonStyle>
+            </Style>
+            <Style id="8146">
+                <IconStyle id="8148">
+                    <color>ff0000ff</color>
+                    <colorMode>normal</colorMode>
+                    <scale>1</scale>
+                    <heading>0</heading>
+                    <Icon id="8149">
+                        <href>http://maps.google.com/mapfiles/kml/shapes/flag.png</href>
+                    </Icon>
+                </IconStyle>
+                <BalloonStyle>
+                    <text>$[name]</text>
+                    <displayMode>default</displayMode>
+                </BalloonStyle>
+            </Style>
+            <Style id="8152">
+                <IconStyle id="8154">
+                    <color>ff0000ff</color>
+                    <colorMode>normal</colorMode>
+                    <scale>1</scale>
+                    <heading>0</heading>
+                    <Icon id="8155">
+                        <href>http://maps.google.com/mapfiles/kml/shapes/flag.png</href>
+                    </Icon>
+                </IconStyle>
+                <BalloonStyle>
+                    <text>$[name]</text>
+                    <displayMode>default</displayMode>
+                </BalloonStyle>
+            </Style>
+            <Style id="8158">
+                <IconStyle id="8160">
+                    <color>ff0000ff</color>
+                    <colorMode>normal</colorMode>
+                    <scale>1</scale>
+                    <heading>0</heading>
+                    <Icon id="8161">
+                        <href>http://maps.google.com/mapfiles/kml/shapes/flag.png</href>
+                    </Icon>
+                </IconStyle>
+                <BalloonStyle>
+                    <text>$[name]</text>
+                    <displayMode>default</displayMode>
+                </BalloonStyle>
+            </Style>
+            <Style id="8164">
+                <IconStyle id="8166">
+                    <color>ff800080</color>
+                    <colorMode>normal</colorMode>
+                    <scale>1</scale>
+                    <heading>0</heading>
+                    <Icon id="8167">
+                        <href>http://maps.google.com/mapfiles/kml/shapes/triangle.png</href>
+                    </Icon>
+                </IconStyle>
+                <BalloonStyle>
+                    <text>$[name]</text>
+                    <displayMode>default</displayMode>
+                </BalloonStyle>
+            </Style>
+            <Style id="8170">
+                <IconStyle id="8172">
+                    <color>ff0000ff</color>
+                    <colorMode>normal</colorMode>
+                    <scale>1</scale>
+                    <heading>0</heading>
+                    <Icon id="8173">
+                        <href>http://maps.google.com/mapfiles/kml/shapes/flag.png</href>
+                    </Icon>
+                </IconStyle>
+                <BalloonStyle>
+                    <text>$[name]</text>
+                    <displayMode>default</displayMode>
+                </BalloonStyle>
+            </Style>
+            <Style id="8176">
+                <IconStyle id="8178">
+                    <color>ff0000ff</color>
+                    <colorMode>normal</colorMode>
+                    <scale>1</scale>
+                    <heading>0</heading>
+                    <Icon id="8179">
+                        <href>http://maps.google.com/mapfiles/kml/shapes/flag.png</href>
+                    </Icon>
+                </IconStyle>
+                <BalloonStyle>
+                    <text>$[name]</text>
+                    <displayMode>default</displayMode>
+                </BalloonStyle>
+            </Style>
+            <Style id="8182">
+                <IconStyle id="8184">
+                    <color>ff0000ff</color>
+                    <colorMode>normal</colorMode>
+                    <scale>1</scale>
+                    <heading>0</heading>
+                    <Icon id="8185">
+                        <href>http://maps.google.com/mapfiles/kml/shapes/flag.png</href>
+                    </Icon>
+                </IconStyle>
+                <BalloonStyle>
+                    <text>$[name]</text>
+                    <displayMode>default</displayMode>
+                </BalloonStyle>
+            </Style>
+            <Style id="8188">
+                <IconStyle id="8190">
+                    <color>ff0000ff</color>
+                    <colorMode>normal</colorMode>
+                    <scale>1</scale>
+                    <heading>0</heading>
+                    <Icon id="8191">
+                        <href>http://maps.google.com/mapfiles/kml/shapes/flag.png</href>
+                    </Icon>
+                </IconStyle>
+                <BalloonStyle>
+                    <text>$[name]</text>
+                    <displayMode>default</displayMode>
+                </BalloonStyle>
+            </Style>
+            <Style id="8194">
+                <IconStyle id="8196">
+                    <color>ff0000ff</color>
+                    <colorMode>normal</colorMode>
+                    <scale>1</scale>
+                    <heading>0</heading>
+                    <Icon id="8197">
+                        <href>http://maps.google.com/mapfiles/kml/shapes/flag.png</href>
+                    </Icon>
+                </IconStyle>
+                <BalloonStyle>
+                    <text>$[name]</text>
+                    <displayMode>default</displayMode>
+                </BalloonStyle>
+            </Style>
+            <Style id="8200">
+                <IconStyle id="8202">
+                    <color>ff0000ff</color>
+                    <colorMode>normal</colorMode>
+                    <scale>1</scale>
+                    <heading>0</heading>
+                    <Icon id="8203">
+                        <href>http://maps.google.com/mapfiles/kml/shapes/flag.png</href>
+                    </Icon>
+                </IconStyle>
+                <BalloonStyle>
+                    <text>$[name]</text>
+                    <displayMode>default</displayMode>
+                </BalloonStyle>
+            </Style>
+            <Style id="8206">
+                <IconStyle id="8208">
+                    <color>ff0000ff</color>
+                    <colorMode>normal</colorMode>
+                    <scale>1</scale>
+                    <heading>0</heading>
+                    <Icon id="8209">
+                        <href>http://maps.google.com/mapfiles/kml/shapes/flag.png</href>
+                    </Icon>
+                </IconStyle>
+                <BalloonStyle>
+                    <text>$[name]</text>
+                    <displayMode>default</displayMode>
+                </BalloonStyle>
+            </Style>
+            <Style id="8212">
+                <IconStyle id="8214">
+                    <color>ff0000ff</color>
+                    <colorMode>normal</colorMode>
+                    <scale>1</scale>
+                    <heading>0</heading>
+                    <Icon id="8215">
+                        <href>http://maps.google.com/mapfiles/kml/shapes/flag.png</href>
+                    </Icon>
+                </IconStyle>
+                <BalloonStyle>
+                    <text>$[name]</text>
+                    <displayMode>default</displayMode>
+                </BalloonStyle>
+            </Style>
+            <Style id="8218">
+                <IconStyle id="8220">
+                    <color>ff0000ff</color>
+                    <colorMode>normal</colorMode>
+                    <scale>1</scale>
+                    <heading>0</heading>
+                    <Icon id="8221">
+                        <href>http://maps.google.com/mapfiles/kml/shapes/flag.png</href>
+                    </Icon>
+                </IconStyle>
+                <BalloonStyle>
+                    <text>$[name]</text>
+                    <displayMode>default</displayMode>
+                </BalloonStyle>
+            </Style>
+            <Style id="8224">
+                <IconStyle id="8226">
+                    <color>ff0000ff</color>
+                    <colorMode>normal</colorMode>
+                    <scale>1</scale>
+                    <heading>0</heading>
+                    <Icon id="8227">
+                        <href>http://maps.google.com/mapfiles/kml/shapes/flag.png</href>
+                    </Icon>
+                </IconStyle>
+                <BalloonStyle>
+                    <text>$[name]</text>
+                    <displayMode>default</displayMode>
+                </BalloonStyle>
+            </Style>
+            <Style id="8230">
+                <IconStyle id="8232">
+                    <color>ff0000ff</color>
+                    <colorMode>normal</colorMode>
+                    <scale>1</scale>
+                    <heading>0</heading>
+                    <Icon id="8233">
+                        <href>http://maps.google.com/mapfiles/kml/shapes/flag.png</href>
+                    </Icon>
+                </IconStyle>
+                <BalloonStyle>
+                    <text>$[name]</text>
+                    <displayMode>default</displayMode>
+                </BalloonStyle>
+            </Style>
+            <Style id="8236">
+                <IconStyle id="8238">
+                    <color>ff0000ff</color>
+                    <colorMode>normal</colorMode>
+                    <scale>1</scale>
+                    <heading>0</heading>
+                    <Icon id="8239">
+                        <href>http://maps.google.com/mapfiles/kml/shapes/flag.png</href>
+                    </Icon>
+                </IconStyle>
+                <BalloonStyle>
+                    <text>$[name]</text>
+                    <displayMode>default</displayMode>
+                </BalloonStyle>
+            </Style>
+            <Style id="8242">
+                <IconStyle id="8244">
+                    <color>ff0000ff</color>
+                    <colorMode>normal</colorMode>
+                    <scale>1</scale>
+                    <heading>0</heading>
+                    <Icon id="8245">
+                        <href>http://maps.google.com/mapfiles/kml/shapes/flag.png</href>
+                    </Icon>
+                </IconStyle>
+                <BalloonStyle>
+                    <text>$[name]</text>
+                    <displayMode>default</displayMode>
+                </BalloonStyle>
+            </Style>
+            <Style id="8248">
+                <IconStyle id="8250">
+                    <color>ff0000ff</color>
+                    <colorMode>normal</colorMode>
+                    <scale>1</scale>
+                    <heading>0</heading>
+                    <Icon id="8251">
+                        <href>http://maps.google.com/mapfiles/kml/shapes/flag.png</href>
+                    </Icon>
+                </IconStyle>
+                <BalloonStyle>
+                    <text>$[name]</text>
+                    <displayMode>default</displayMode>
+                </BalloonStyle>
+            </Style>
+            <Style id="8254">
+                <IconStyle id="8256">
+                    <color>ff0000ff</color>
+                    <colorMode>normal</colorMode>
+                    <scale>1</scale>
+                    <heading>0</heading>
+                    <Icon id="8257">
+                        <href>http://maps.google.com/mapfiles/kml/shapes/flag.png</href>
+                    </Icon>
+                </IconStyle>
+                <BalloonStyle>
+                    <text>$[name]</text>
+                    <displayMode>default</displayMode>
+                </BalloonStyle>
+            </Style>
+            <Style id="8260">
+                <IconStyle id="8262">
+                    <color>ff800080</color>
+                    <colorMode>normal</colorMode>
+                    <scale>1</scale>
+                    <heading>0</heading>
+                    <Icon id="8263">
+                        <href>http://maps.google.com/mapfiles/kml/shapes/triangle.png</href>
+                    </Icon>
+                </IconStyle>
+                <BalloonStyle>
+                    <text>$[name]</text>
+                    <displayMode>default</displayMode>
+                </BalloonStyle>
+            </Style>
+            <name>AGMs</name>
+            <Placemark id="8115">
+                <name>000</name>
+                <description>000</description>
+                <styleUrl>#8116</styleUrl>
+                <Point id="8114">
+                    <coordinates>-97.5293304,35.797995,0.0</coordinates>
+                </Point>
+            </Placemark>
+            <Placemark id="8121">
+                <name>010</name>
+                <description>010</description>
+                <styleUrl>#8122</styleUrl>
+                <Point id="8120">
+                    <coordinates>-97.5142467,35.8063035,0.0</coordinates>
+                </Point>
+            </Placemark>
+            <Placemark id="8127">
+                <name>020</name>
+                <description>020</description>
+                <styleUrl>#8128</styleUrl>
+                <Point id="8126">
+                    <coordinates>-97.5022436,35.8142568,0.0</coordinates>
+                </Point>
+            </Placemark>
+            <Placemark id="8133">
+                <name>030</name>
+                <description>030</description>
+                <styleUrl>#8134</styleUrl>
+                <Point id="8132">
+                    <coordinates>-97.4894893,35.8223554,0.0</coordinates>
+                </Point>
+            </Placemark>
+            <Placemark id="8139">
+                <name>040</name>
+                <description>040</description>
+                <styleUrl>#8140</styleUrl>
+                <Point id="8138">
+                    <coordinates>-97.4784939,35.8289629,0.0</coordinates>
+                </Point>
+            </Placemark>
+            <Placemark id="8145">
+                <name>050</name>
+                <description>050</description>
+                <styleUrl>#8146</styleUrl>
+                <Point id="8144">
+                    <coordinates>-97.4641935,35.8379281,0.0</coordinates>
+                </Point>
+            </Placemark>
+            <Placemark id="8151">
+                <name>060</name>
+                <description>060</description>
+                <styleUrl>#8152</styleUrl>
+                <Point id="8150">
+                    <coordinates>-97.4518161,35.8446502,0.0</coordinates>
+                </Point>
+            </Placemark>
+            <Placemark id="8157">
+                <name>070</name>
+                <description>070</description>
+                <styleUrl>#8158</styleUrl>
+                <Point id="8156">
+                    <coordinates>-97.4364152,35.8531346,0.0</coordinates>
+                </Point>
+            </Placemark>
+            <Placemark id="8163">
+                <name>080</name>
+                <description>080</description>
+                <styleUrl>#8164</styleUrl>
+                <Point id="8162">
+                    <coordinates>-97.4259926,35.8553523,0.0</coordinates>
+                </Point>
+            </Placemark>
+            <Placemark id="8169">
+                <name>090</name>
+                <description>090</description>
+                <styleUrl>#8170</styleUrl>
+                <Point id="8168">
+                    <coordinates>-97.4140634,35.8574223,0.0</coordinates>
+                </Point>
+            </Placemark>
+            <Placemark id="8175">
+                <name>100</name>
+                <description>100</description>
+                <styleUrl>#8176</styleUrl>
+                <Point id="8174">
+                    <coordinates>-97.3958835,35.8587676,0.0</coordinates>
+                </Point>
+            </Placemark>
+            <Placemark id="8181">
+                <name>110</name>
+                <description>110</description>
+                <styleUrl>#8182</styleUrl>
+                <Point id="8180">
+                    <coordinates>-97.380958,35.8633068,0.0</coordinates>
+                </Point>
+            </Placemark>
+            <Placemark id="8187">
+                <name>120</name>
+                <description>120</description>
+                <styleUrl>#8188</styleUrl>
+                <Point id="8186">
+                    <coordinates>-97.3701037,35.8670372,0.0</coordinates>
+                </Point>
+            </Placemark>
+            <Placemark id="8193">
+                <name>130</name>
+                <description>130</description>
+                <styleUrl>#8194</styleUrl>
+                <Point id="8192">
+                    <coordinates>-97.3556256,35.8755122,0.0</coordinates>
+                </Point>
+            </Placemark>
+            <Placemark id="8199">
+                <name>140</name>
+                <description>140</description>
+                <styleUrl>#8200</styleUrl>
+                <Point id="8198">
+                    <coordinates>-97.3412272,35.8817428,0.0</coordinates>
+                </Point>
+            </Placemark>
+            <Placemark id="8205">
+                <name>150</name>
+                <description>150</description>
+                <styleUrl>#8206</styleUrl>
+                <Point id="8204">
+                    <coordinates>-97.33147,35.8869216,0.0</coordinates>
+                </Point>
+            </Placemark>
+            <Placemark id="8211">
+                <name>160</name>
+                <description>160</description>
+                <styleUrl>#8212</styleUrl>
+                <Point id="8210">
+                    <coordinates>-97.3182334,35.8928547,0.0</coordinates>
+                </Point>
+            </Placemark>
+            <Placemark id="8217">
+                <name>170</name>
+                <description>170</description>
+                <styleUrl>#8218</styleUrl>
+                <Point id="8216">
+                    <coordinates>-97.3005161,35.900968,0.0</coordinates>
+                </Point>
+            </Placemark>
+            <Placemark id="8223">
+                <name>180</name>
+                <description>180</description>
+                <styleUrl>#8224</styleUrl>
+                <Point id="8222">
+                    <coordinates>-97.2902683,35.9057115,0.0</coordinates>
+                </Point>
+            </Placemark>
+            <Placemark id="8229">
+                <name>190</name>
+                <description>190</description>
+                <styleUrl>#8230</styleUrl>
+                <Point id="8228">
+                    <coordinates>-97.2758192,35.9037988,0.0</coordinates>
+                </Point>
+            </Placemark>
+            <Placemark id="8235">
+                <name>200</name>
+                <description>200</description>
+                <styleUrl>#8236</styleUrl>
+                <Point id="8234">
+                    <coordinates>-97.2678895,35.9131543,0.0</coordinates>
+                </Point>
+            </Placemark>
+            <Placemark id="8241">
+                <name>205</name>
+                <description>205</description>
+                <styleUrl>#8242</styleUrl>
+                <Point id="8240">
+                    <coordinates>-97.264752,35.9173286,0.0</coordinates>
+                </Point>
+            </Placemark>
+            <Placemark id="8247">
+                <name>210</name>
+                <description>210</description>
+                <styleUrl>#8248</styleUrl>
+                <Point id="8246">
+                    <coordinates>-97.2471857,35.9252966,0.0</coordinates>
+                </Point>
+            </Placemark>
+            <Placemark id="8253">
+                <name>220</name>
+                <description>220</description>
+                <styleUrl>#8254</styleUrl>
+                <Point id="8252">
+                    <coordinates>-97.245553,35.9276713,0.0</coordinates>
+                </Point>
+            </Placemark>
+            <Placemark id="8259">
+                <name>230</name>
+                <description>230</description>
+                <styleUrl>#8260</styleUrl>
+                <Point id="8258">
+                    <coordinates>-97.2432599,35.9423507,0.0</coordinates>
+                </Point>
+            </Placemark>
+        </Folder>
+        <Folder id="8264">
+            <Style id="8267">
+                <LineStyle id="8268">
+                    <color>ffff0000</color>
+                    <colorMode>normal</colorMode>
+                    <width>3</width>
+                </LineStyle>
+            </Style>
+            <name>Access</name>
+            <Placemark id="8266">
+                <styleUrl>#8267</styleUrl>
+                <LineString id="8265">
+                    <coordinates>-97.529547,35.798218,0.0 -97.529548,35.798217,0.0 -97.529552,35.798217,0.0 -97.529557,35.798218,0.0 -97.529562,35.798218,0.0 -97.529565,35.79822,0.0 -97.529572,35.79822,0.0 -97.529575,35.798222,0.0 -97.529578,35.798222,0.0 -97.529583,35.798223,0.0 -97.529588,35.798223,0.0 -97.529592,35.798223,0.0 -97.529597,35.798225,0.0 -97.529602,35.798225,0.0 -97.529603,35.798227,0.0 -97.529608,35.798227,0.0 -97.529617,35.798228,0.0 -97.529623,35.798227,0.0 -97.529623,35.798225,0.0 -97.529623,35.798222,0.0 -97.529627,35.798218,0.0 -97.52963,35.798215,0.0 -97.529637,35.798212,0.0 -97.529633,35.798217,0.0 -97.529638,35.798222,0.0 -97.529642,35.798223,0.0 -97.529652,35.798228,0.0 -97.529665,35.798228,0.0 -97.529672,35.798228,0.0 -97.529678,35.798227,0.0 -97.529677,35.798228,0.0 -97.529675,35.798233,0.0 -97.529677,35.798235,0.0 -97.529683,35.798233,0.0 -97.529685,35.798238,0.0 -97.529692,35.79824,0.0 -97.529692,35.798243,0.0 -97.529683,35.798242,0.0 -97.52968,35.798238,0.0 -97.529673,35.798238,0.0 -97.529673,35.798232,0.0 -97.529673,35.798227,0.0 -97.529675,35.798223,0.0 -97.529678,35.798225,0.0 -97.529683,35.798228,0.0 -97.529688,35.798227,0.0 -97.529702,35.798222,0.0 -97.529713,35.79822,0.0 -97.529715,35.798218,0.0 -97.529717,35.798218,0.0 -97.529717,35.798217,0.0 -97.529707,35.798223,0.0 -97.529703,35.798225,0.0 -97.529698,35.798228,0.0 -97.5297,35.798232,0.0 -97.529697,35.798235,0.0 -97.529688,35.798235,0.0 -97.529693,35.798235,0.0 -97.529695,35.798233,0.0 -97.529698,35.79823,0.0 -97.529707,35.798227,0.0 -97.52971,35.798225,0.0 -97.529712,35.79822,0.0 -97.529715,35.798217,0.0 -97.529718,35.798213,0.0 -97.529718,35.798207,0.0 -97.529725,35.798207,0.0 -97.52973,35.798207,0.0 -97.529735,35.798207,0.0 -97.52974,35.798207,0.0 -97.529743,35.798207,0.0 -97.529743,35.798208,0.0 -97.529747,35.79821,0.0 -97.529748,35.798212,0.0 -97.52975,35.79821,0.0 -97.529755,35.798212,0.0 -97.529758,35.798212,0.0 -97.529763,35.798212,0.0 -97.529767,35.79821,0.0 -97.52977,35.79821,0.0 -97.529777,35.79821,0.0 -97.529775,35.798207,0.0 -97.529777,35.798208,0.0 -97.529777,35.798207,0.0 -97.529782,35.798205,0.0 -97.529778,35.798202,0.0 -97.529755,35.79819,0.0 -97.529742,35.798185,0.0 -97.529735,35.798177,0.0 -97.52973,35.798168,0.0 -97.529727,35.798162,0.0 -97.529725,35.798158,0.0 -97.529723,35.798153,0.0 -97.529725,35.798152,0.0 -97.529728,35.798148,0.0 -97.529737,35.79815,0.0 -97.529742,35.798147,0.0 -97.529732,35.798145,0.0 -97.529722,35.798148,0.0 -97.529707,35.79815,0.0 -97.529683,35.798157,0.0 -97.52965,35.798158,0.0 -97.529548,35.798165,0.0 -97.529342,35.79817,0.0 -97.52918,35.798168,0.0 -97.52891,35.798168,0.0 -97.528623,35.79818,0.0 -97.528438,35.798188,0.0 -97.528128,35.7982,0.0 -97.527798,35.798203,0.0 -97.527577,35.798203,0.0 -97.527225,35.798203,0.0 -97.526852,35.798205,0.0 -97.526607,35.798205,0.0 -97.526252,35.798205,0.0 -97.525913,35.798197,0.0 -97.525687,35.798197,0.0 -97.525335,35.798202,0.0 -97.524968,35.798213,0.0 -97.524708,35.798217,0.0 -97.524308,35.79822,0.0 -97.523907,35.79823,0.0 -97.523638,35.798235,0.0 -97.523245,35.798238,0.0 -97.522835,35.79824,0.0 -97.522567,35.798243,0.0 -97.52216,35.798247,0.0 -97.521755,35.798255,0.0 -97.521488,35.798257,0.0 -97.521082,35.798257,0.0 -97.520658,35.798252,0.0 -97.520377,35.798245,0.0 -97.519955,35.798235,0.0 -97.519543,35.798232,0.0 -97.519265,35.79823,0.0 -97.518862,35.798232,0.0 -97.51845,35.798237,0.0 -97.518175,35.798238,0.0 -97.517763,35.798245,0.0 -97.517353,35.798253,0.0 -97.517087,35.798258,0.0 -97.516688,35.79826,0.0 -97.51629,35.798255,0.0 -97.516022,35.798257,0.0 -97.515618,35.79826,0.0 -97.515215,35.798263,0.0 -97.514952,35.798265,0.0 -97.514588,35.798263,0.0 -97.514333,35.798258,0.0 -97.514213,35.79827,0.0 -97.514105,35.798337,0.0 -97.514085,35.798473,0.0 -97.51408,35.798608,0.0 -97.514082,35.79885,0.0 -97.514087,35.79912,0.0 -97.514095,35.799315,0.0 -97.514095,35.799613,0.0 -97.514103,35.799938,0.0 -97.514108,35.80016,0.0 -97.514112,35.800495,0.0 -97.514118,35.800845,0.0 -97.514123,35.801078,0.0 -97.514137,35.801432,0.0 -97.514142,35.801775,0.0 -97.51415,35.802002,0.0 -97.514162,35.80233,0.0 -97.514167,35.802665,0.0 -97.51417,35.802893,0.0 -97.514182,35.80324,0.0 -97.514197,35.803575,0.0 -97.514202,35.803792,0.0 -97.514207,35.804077,0.0 -97.514215,35.804363,0.0 -97.514218,35.80456,0.0 -97.514203,35.804828,0.0 -97.514188,35.805077,0.0 -97.514188,35.805235,0.0 -97.514173,35.805423,0.0 -97.514165,35.8056,0.0 -97.514165,35.80571,0.0 -97.514168,35.805837,0.0 -97.514167,35.80588,0.0 -97.514167,35.805875,0.0 -97.514167,35.805872,0.0 -97.514165,35.80592,0.0 -97.514173,35.806042,0.0 -97.51418,35.80622,0.0 -97.51418,35.806362,0.0 -97.514175,35.806587,0.0 -97.514178,35.806822,0.0 -97.514182,35.806987,0.0 -97.51418,35.80726,0.0 -97.514173,35.807567,0.0 -97.514172,35.807785,0.0 -97.514175,35.8081,0.0 -97.51417,35.808407,0.0 -97.514167,35.808605,0.0 -97.514167,35.808908,0.0 -97.514167,35.809227,0.0 -97.51417,35.80944,0.0 -97.514178,35.809768,0.0 -97.514185,35.810095,0.0 -97.514188,35.810312,0.0 -97.514192,35.810637,0.0 -97.514197,35.81096,0.0 -97.514202,35.811168,0.0 -97.514202,35.811485,0.0 -97.514203,35.811805,0.0 -97.514207,35.812015,0.0 -97.514212,35.812307,0.0 -97.514218,35.812572,0.0 -97.51422,35.812728,0.0 -97.514228,35.812897,0.0 -97.514275,35.812995,0.0 -97.514323,35.813012,0.0 -97.514395,35.813013,0.0 -97.514408,35.813012,0.0 -97.514372,35.813017,0.0 -97.514337,35.81301,0.0 -97.514273,35.813002,0.0 -97.514227,35.813007,0.0 -97.51422,35.813008,0.0 -97.514212,35.812973,0.0 -97.514182,35.81287,0.0 -97.514173,35.812742,0.0 -97.514183,35.812472,0.0 -97.514187,35.812155,0.0 -97.514185,35.811925,0.0 -97.514198,35.811537,0.0 -97.514197,35.81112,0.0 -97.51419,35.810838,0.0 -97.514187,35.810432,0.0 -97.514177,35.810038,0.0 -97.514173,35.809777,0.0 -97.514163,35.809395,0.0 -97.51416,35.809008,0.0 -97.514157,35.808753,0.0 -97.514158,35.808348,0.0 -97.51416,35.807935,0.0 -97.51417,35.807658,0.0 -97.514172,35.807275,0.0 -97.514183,35.806907,0.0 -97.514187,35.806677,0.0 -97.514197,35.806308,0.0 -97.514193,35.80595,0.0 -97.514188,35.805728,0.0 -97.514183,35.805387,0.0 -97.514185,35.805008,0.0 -97.514187,35.804738,0.0 -97.514183,35.804332,0.0 -97.514178,35.803948,0.0 -97.51417,35.803718,0.0 -97.514158,35.803383,0.0 -97.51415,35.803043,0.0 -97.514128,35.80285,0.0 -97.514117,35.802575,0.0 -97.514115,35.802367,0.0 -97.51411,35.802255,0.0 -97.514115,35.802142,0.0 -97.514117,35.802118,0.0 -97.514112,35.802058,0.0 -97.5141,35.801903,0.0 -97.514113,35.801787,0.0 -97.514168,35.801768,0.0 -97.514192,35.801772,0.0 -97.514182,35.801772,0.0 -97.51415,35.80178,0.0 -97.514127,35.80179,0.0 -97.51413,35.801857,0.0 -97.514125,35.801947,0.0 -97.514118,35.802143,0.0 -97.514125,35.802415,0.0 -97.51413,35.802625,0.0 -97.514148,35.802947,0.0 -97.514153,35.803258,0.0 -97.51415,35.803472,0.0 -97.514142,35.803775,0.0 -97.514147,35.804082,0.0 -97.514152,35.8043,0.0 -97.514167,35.804612,0.0 -97.514167,35.804898,0.0 -97.514165,35.805075,0.0 -97.514168,35.80533,0.0 -97.514177,35.805565,0.0 -97.514182,35.805712,0.0 -97.514195,35.805935,0.0 -97.514213,35.806127,0.0 -97.51423,35.80621,0.0 -97.514235,35.806285,0.0 -97.51423,35.806293,0.0 -97.514125,35.806257,0.0 -97.514122,35.806258,0.0 -97.514113,35.806273,0.0 -97.514052,35.806255,0.0 -97.514158,35.806298,0.0 -97.514125,35.806322,0.0 -97.514122,35.806325,0.0 -97.51422,35.80628,0.0 -97.514223,35.80628,0.0 -97.514198,35.806303,0.0 -97.514178,35.806353,0.0 -97.514167,35.806458,0.0 -97.514165,35.806567,0.0 -97.514165,35.806738,0.0 -97.514167,35.806938,0.0 -97.514165,35.80709,0.0 -97.514168,35.807348,0.0 -97.514167,35.807637,0.0 -97.514167,35.807847,0.0 -97.514165,35.808182,0.0 -97.514162,35.808523,0.0 -97.514162,35.80875,0.0 -97.514165,35.8091,0.0 -97.514165,35.809462,0.0 -97.514165,35.809712,0.0 -97.51417,35.810093,0.0 -97.514175,35.81048,0.0 -97.514178,35.810732,0.0 -97.514185,35.811112,0.0 -97.514188,35.811492,0.0 -97.514188,35.811748,0.0 -97.514192,35.81214,0.0 -97.514195,35.812502,0.0 -97.514195,35.812708,0.0 -97.514185,35.81292,0.0 -97.51407,35.812997,0.0 -97.513938,35.813,0.0 -97.513658,35.812993,0.0 -97.513295,35.812993,0.0 -97.513018,35.812988,0.0 -97.512587,35.812982,0.0 -97.512135,35.812977,0.0 -97.51183,35.812968,0.0 -97.511405,35.81296,0.0 -97.511028,35.81295,0.0 -97.5108,35.812943,0.0 -97.510478,35.812933,0.0 -97.510147,35.812937,0.0 -97.509907,35.812932,0.0 -97.509507,35.812938,0.0 -97.509057,35.812943,0.0 -97.508743,35.812947,0.0 -97.508273,35.812945,0.0 -97.507812,35.812947,0.0 -97.507508,35.812947,0.0 -97.507063,35.81294,0.0 -97.50662,35.812937,0.0 -97.50632,35.812933,0.0 -97.50587,35.812923,0.0 -97.505432,35.812915,0.0 -97.505143,35.812907,0.0 -97.504698,35.8129,0.0 -97.504262,35.812892,0.0 -97.503988,35.81289,0.0 -97.503568,35.812883,0.0 -97.503152,35.81288,0.0 -97.502888,35.812877,0.0 -97.502548,35.812875,0.0 -97.502302,35.81286,0.0 -97.502203,35.81287,0.0 -97.502163,35.812942,0.0 -97.502177,35.813048,0.0 -97.50218,35.813127,0.0 -97.50219,35.813278,0.0 -97.502195,35.813445,0.0 -97.5022,35.813555,0.0 -97.5022,35.813717,0.0 -97.502197,35.813868,0.0 -97.502192,35.813955,0.0 -97.502193,35.814083,0.0 -97.502205,35.814193,0.0 -97.502203,35.814245,0.0 -97.502203,35.814292,0.0 -97.502205,35.814317,0.0 -97.502207,35.81432,0.0 -97.502198,35.814272,0.0 -97.502198,35.814208,0.0 -97.502198,35.814152,0.0 -97.502193,35.814078,0.0 -97.502187,35.814022,0.0 -97.502187,35.81398,0.0 -97.502188,35.813913,0.0 -97.502187,35.813833,0.0 -97.50219,35.813773,0.0 -97.502193,35.813683,0.0 -97.502195,35.8136,0.0 -97.502195,35.813548,0.0 -97.502195,35.81346,0.0 -97.502195,35.813367,0.0 -97.502195,35.8133,0.0 -97.502195,35.813192,0.0 -97.502193,35.813105,0.0 -97.502197,35.813058,0.0 -97.502198,35.813005,0.0 -97.502203,35.812972,0.0 -97.502207,35.812948,0.0 -97.502208,35.812923,0.0 -97.502185,35.81294,0.0 -97.502162,35.812937,0.0 -97.502025,35.812947,0.0 -97.501835,35.81294,0.0 -97.501665,35.812938,0.0 -97.501365,35.812935,0.0 -97.50108,35.81293,0.0 -97.500895,35.812932,0.0 -97.50061,35.812937,0.0 -97.500293,35.812943,0.0 -97.500058,35.812947,0.0 -97.499682,35.812948,0.0 -97.499318,35.812937,0.0 -97.499095,35.812923,0.0 -97.49877,35.812908,0.0 -97.498428,35.812898,0.0 -97.498197,35.812892,0.0 -97.497838,35.812883,0.0 -97.49749,35.812878,0.0 -97.497268,35.812875,0.0 -97.49694,35.812872,0.0 -97.49662,35.812868,0.0 -97.496403,35.812863,0.0 -97.496093,35.812862,0.0 -97.495788,35.81286,0.0 -97.495567,35.812862,0.0 -97.49521,35.812863,0.0 -97.49484,35.812862,0.0 -97.494592,35.812857,0.0 -97.494218,35.812852,0.0 -97.493835,35.81285,0.0 -97.493577,35.812848,0.0 -97.493183,35.812842,0.0 -97.492772,35.81283,0.0 -97.492505,35.812828,0.0 -97.492107,35.812827,0.0 -97.491698,35.812827,0.0 -97.49141,35.812818,0.0 -97.490967,35.81281,0.0 -97.490513,35.812812,0.0 -97.490208,35.812815,0.0 -97.489743,35.812812,0.0 -97.489293,35.81281,0.0 -97.488987,35.812807,0.0 -97.488533,35.812802,0.0 -97.48808,35.812798,0.0 -97.487772,35.8128,0.0 -97.487318,35.8128,0.0 -97.486865,35.8128,0.0 -97.486557,35.8128,0.0 -97.486085,35.812797,0.0 -97.485602,35.81279,0.0 -97.485277,35.812785,0.0 -97.4848,35.812775,0.0 -97.48434,35.812773,0.0 -97.484043,35.812775,0.0 -97.483588,35.812782,0.0 -97.483105,35.81278,0.0 -97.48277,35.812778,0.0 -97.482273,35.812773,0.0 -97.4818,35.81277,0.0 -97.481507,35.81277,0.0 -97.481073,35.812772,0.0 -97.480647,35.812768,0.0 -97.480383,35.812765,0.0 -97.480077,35.812805,0.0 -97.479873,35.81294,0.0 -97.47981,35.813102,0.0 -97.479687,35.813365,0.0 -97.479533,35.81365,0.0 -97.479393,35.81384,0.0 -97.479165,35.814112,0.0 -97.478938,35.814337,0.0 -97.47878,35.814427,0.0 -97.47858,35.814472,0.0 -97.478493,35.81448,0.0 -97.478485,35.814478,0.0 -97.47847,35.81449,0.0 -97.47843,35.814535,0.0 -97.478418,35.814698,0.0 -97.478418,35.814867,0.0 -97.478413,35.815187,0.0 -97.478407,35.815552,0.0 -97.478405,35.81581,0.0 -97.478407,35.816205,0.0 -97.47841,35.816613,0.0 -97.478412,35.816882,0.0 -97.478417,35.81728,0.0 -97.478413,35.817682,0.0 -97.47841,35.817952,0.0 -97.47841,35.818373,0.0 -97.478413,35.81881,0.0 -97.478412,35.8191,0.0 -97.47841,35.819507,0.0 -97.478408,35.819898,0.0 -97.478407,35.82014,0.0 -97.478403,35.820442,0.0 -97.478427,35.820637,0.0 -97.478487,35.820722,0.0 -97.478648,35.820752,0.0 -97.478863,35.820747,0.0 -97.47902,35.82074,0.0 -97.479258,35.820732,0.0 -97.47952,35.82072,0.0 -97.479693,35.820712,0.0 -97.47996,35.820698,0.0 -97.480233,35.82068,0.0 -97.480413,35.820663,0.0 -97.480685,35.820647,0.0 -97.48096,35.820663,0.0 -97.481148,35.820693,0.0 -97.48144,35.820742,0.0 -97.481725,35.820792,0.0 -97.48192,35.820825,0.0 -97.482223,35.820878,0.0 -97.482528,35.820917,0.0 -97.482725,35.820943,0.0 -97.483023,35.820972,0.0 -97.483325,35.821018,0.0 -97.483547,35.821047,0.0 -97.483852,35.821093,0.0 -97.484105,35.821137,0.0 -97.484238,35.82117,0.0 -97.484368,35.82126,0.0 -97.484362,35.821403,0.0 -97.484295,35.821512,0.0 -97.484133,35.821678,0.0 -97.483947,35.82185,0.0 -97.48383,35.821968,0.0 -97.48371,35.822147,0.0 -97.4837,35.82233,0.0 -97.483762,35.82244,0.0 -97.483947,35.822552,0.0 -97.484172,35.822638,0.0 -97.484327,35.822688,0.0 -97.484565,35.822763,0.0 -97.484808,35.822827,0.0 -97.484973,35.822882,0.0 -97.485213,35.822967,0.0 -97.485435,35.823047,0.0 -97.48557,35.823113,0.0 -97.485743,35.823235,0.0 -97.485883,35.823357,0.0 -97.485975,35.823453,0.0 -97.486113,35.823607,0.0 -97.486267,35.82377,0.0 -97.48637,35.823875,0.0 -97.486495,35.824005,0.0 -97.4866,35.82411,0.0 -97.486657,35.824165,0.0 -97.48674,35.824248,0.0 -97.486865,35.824303,0.0 -97.486958,35.8243,0.0 -97.487097,35.824288,0.0 -97.487207,35.824285,0.0 -97.487275,35.824308,0.0 -97.487333,35.824383,0.0 -97.487355,35.824503,0.0 -97.487395,35.824577,0.0 -97.487498,35.824655,0.0 -97.48761,35.82468,0.0 -97.487672,35.824687,0.0 -97.487727,35.824697,0.0 -97.487773,35.824707,0.0 -97.487823,35.824715,0.0 -97.487927,35.824717,0.0 -97.48804,35.824712,0.0 -97.488127,35.824713,0.0 -97.48827,35.824717,0.0 -97.488405,35.824732,0.0 -97.48847,35.824743,0.0 -97.48855,35.82473,0.0 -97.488588,35.824707,0.0 -97.488625,35.824677,0.0 -97.48866,35.824647,0.0 -97.488692,35.824622,0.0 -97.488757,35.824573,0.0 -97.488827,35.824523,0.0 -97.488877,35.824485,0.0 -97.488962,35.82442,0.0 -97.489048,35.824357,0.0 -97.489103,35.824313,0.0 -97.489175,35.824235,0.0 -97.489238,35.824145,0.0 -97.489273,35.824087,0.0 -97.489325,35.824008,0.0 -97.489368,35.823938,0.0 -97.489393,35.823895,0.0 -97.489415,35.823857,0.0 -97.489413,35.823857,0.0 -97.48944,35.823818,0.0 -97.489447,35.82378,0.0 -97.489445,35.823717,0.0 -97.489445,35.823668,0.0 -97.489442,35.823635,0.0 -97.489445,35.823568,0.0 -97.489447,35.823485,0.0 -97.489443,35.823433,0.0 -97.48944,35.82336,0.0 -97.489437,35.823285,0.0 -97.489437,35.823238,0.0 -97.489438,35.823178,0.0 -97.489435,35.823118,0.0 -97.489435,35.82308,0.0 -97.489438,35.823017,0.0 -97.489438,35.822963,0.0 -97.489443,35.822933,0.0 -97.48944,35.822882,0.0 -97.48944,35.82283,0.0 -97.48944,35.822797,0.0 -97.489438,35.82275,0.0 -97.48944,35.822712,0.0 -97.489442,35.822687,0.0 -97.489455,35.822622,0.0 -97.48946,35.822525,0.0 -97.489463,35.822473,0.0 -97.489463,35.822443,0.0 -97.489465,35.822448,0.0 -97.489505,35.822457,0.0 -97.489497,35.822517,0.0 -97.489463,35.82255,0.0 -97.489447,35.822558,0.0 -97.489467,35.822592,0.0 -97.489475,35.82262,0.0 -97.48947,35.822683,0.0 -97.48946,35.822763,0.0 -97.489453,35.822832,0.0 -97.489448,35.822952,0.0 -97.48944,35.823102,0.0 -97.48944,35.823215,0.0 -97.489445,35.823382,0.0 -97.489447,35.823542,0.0 -97.489447,35.823633,0.0 -97.489452,35.823758,0.0 -97.489433,35.823855,0.0 -97.489408,35.823888,0.0 -97.489405,35.823887,0.0 -97.489382,35.82392,0.0 -97.489363,35.82395,0.0 -97.489348,35.823975,0.0 -97.489322,35.824012,0.0 -97.489295,35.82405,0.0 -97.489277,35.824087,0.0 -97.489257,35.824115,0.0 -97.489217,35.824167,0.0 -97.489183,35.824213,0.0 -97.489157,35.824245,0.0 -97.489115,35.824285,0.0 -97.489063,35.824323,0.0 -97.48903,35.82435,0.0 -97.488987,35.824387,0.0 -97.48894,35.824418,0.0 -97.488903,35.824445,0.0 -97.488847,35.824485,0.0 -97.488798,35.824518,0.0 -97.488767,35.82454,0.0 -97.488708,35.824573,0.0 -97.48864,35.824612,0.0 -97.488595,35.824635,0.0 -97.488547,35.824675,0.0 -97.48848,35.824712,0.0 -97.478285,35.829158,0.0 -97.478282,35.829163,0.0 -97.478218,35.82924,0.0 -97.478182,35.829235,0.0 -97.478163,35.829212,0.0 -97.47816,35.829208,0.0 -97.478158,35.829202,0.0 -97.478158,35.829197,0.0 -97.478153,35.829193,0.0 -97.47815,35.829192,0.0 -97.478153,35.829192,0.0 -97.47816,35.829192,0.0 -97.478165,35.829185,0.0 -97.47817,35.82918,0.0 -97.478168,35.829172,0.0 -97.478158,35.829178,0.0 -97.47815,35.829182,0.0 -97.47814,35.829187,0.0 -97.478135,35.829188,0.0 -97.478128,35.829192,0.0 -97.478115,35.829197,0.0 -97.478102,35.829198,0.0 -97.4781,35.829203,0.0 -97.47809,35.829203,0.0 -97.478075,35.829205,0.0 -97.47807,35.82921,0.0 -97.478065,35.829205,0.0 -97.478063,35.829192,0.0 -97.47806,35.829188,0.0 -97.478058,35.82918,0.0 -97.478058,35.829173,0.0 -97.478058,35.82917,0.0 -97.47805,35.829168,0.0 -97.478047,35.829165,0.0 -97.478047,35.829162,0.0 -97.478052,35.82916,0.0 -97.478055,35.829155,0.0 -97.478052,35.829155,0.0 -97.47805,35.82915,0.0 -97.478047,35.829148,0.0 -97.478043,35.82915,0.0 -97.478038,35.829153,0.0 -97.478037,35.829162,0.0 -97.47803,35.829167,0.0 -97.478022,35.829168,0.0 -97.478013,35.82916,0.0 -97.478008,35.829152,0.0 -97.478012,35.829143,0.0 -97.478017,35.829143,0.0 -97.47802,35.829142,0.0 -97.47801,35.829142,0.0 -97.477997,35.829143,0.0 -97.477985,35.829143,0.0 -97.477977,35.829142,0.0 -97.477972,35.829142,0.0 -97.477963,35.829137,0.0 -97.477958,35.829137,0.0 -97.477942,35.829138,0.0 -97.477932,35.829138,0.0 -97.477927,35.829137,0.0 -97.477925,35.829133,0.0 -97.477923,35.829102,0.0 -97.477923,35.82912,0.0 -97.477942,35.829162,0.0 -97.477962,35.82922,0.0 -97.477972,35.829283,0.0 -97.477988,35.829432,0.0 -97.477995,35.829658,0.0 -97.477997,35.829842,0.0 -97.478005,35.830145,0.0 -97.478012,35.830475,0.0 -97.478015,35.830717,0.0 -97.478028,35.831105,0.0 -97.478047,35.83152,0.0 -97.478057,35.831807,0.0 -97.478083,35.83225,0.0 -97.478088,35.8327,0.0 -97.478092,35.83302,0.0 -97.478103,35.83351,0.0 -97.478108,35.833988,0.0 -97.478117,35.834307,0.0 -97.478128,35.834785,0.0 -97.478152,35.835287,0.0 -97.478168,35.83564,0.0 -97.478193,35.836173,0.0 -97.478208,35.836692,0.0 -97.478218,35.837032,0.0 -97.478238,35.83753,0.0 -97.478248,35.838028,0.0 -97.478257,35.838363,0.0 -97.47827,35.838875,0.0 -97.478285,35.83938,0.0 -97.478285,35.83971,0.0 -97.478292,35.840212,0.0 -97.47829,35.840723,0.0 -97.478297,35.841057,0.0 -97.478312,35.841478,0.0 -97.478325,35.841743,0.0 -97.4783,35.84183,0.0 -97.478168,35.841888,0.0 -97.477928,35.841902,0.0 -97.477717,35.841907,0.0 -97.477347,35.841918,0.0 -97.47695,35.841922,0.0 -97.47668,35.841923,0.0 -97.476267,35.841912,0.0 -97.47585,35.841902,0.0 -97.475577,35.841892,0.0 -97.475147,35.841877,0.0 -97.47469,35.841867,0.0 -97.47438,35.841863,0.0 -97.473913,35.841862,0.0 -97.473477,35.84186,0.0 -97.473213,35.841865,0.0 -97.472828,35.841858,0.0 -97.472425,35.841853,0.0 -97.472152,35.841848,0.0 -97.471725,35.84185,0.0 -97.471278,35.841853,0.0 -97.470987,35.841853,0.0 -97.470562,35.84185,0.0 -97.470127,35.841835,0.0 -97.469828,35.84183,0.0 -97.46936,35.841812,0.0 -97.468892,35.841797,0.0 -97.468593,35.841788,0.0 -97.468163,35.841768,0.0 -97.467738,35.84175,0.0 -97.467457,35.841737,0.0 -97.46704,35.841718,0.0 -97.466633,35.841703,0.0 -97.466378,35.841693,0.0 -97.466017,35.841678,0.0 -97.46567,35.841675,0.0 -97.46542,35.841668,0.0 -97.465038,35.84166,0.0 -97.464663,35.84165,0.0 -97.464402,35.841642,0.0 -97.463975,35.841623,0.0 -97.463517,35.841613,0.0 -97.463205,35.841603,0.0 -97.462733,35.84159,0.0 -97.462275,35.841583,0.0 -97.461977,35.841583,0.0 -97.46155,35.841587,0.0 -97.461162,35.841587,0.0 -97.460942,35.841592,0.0 -97.460672,35.841593,0.0 -97.460523,35.841587,0.0 -97.460475,35.841567,0.0 -97.460438,35.84146,0.0 -97.460428,35.841263,0.0 -97.460428,35.841098,0.0 -97.460433,35.840812,0.0 -97.460432,35.840505,0.0 -97.46043,35.840303,0.0 -97.460427,35.839997,0.0 -97.460427,35.839685,0.0 -97.460425,35.839475,0.0 -97.460425,35.839142,0.0 -97.46043,35.838797,0.0 -97.460435,35.838577,0.0 -97.460437,35.838267,0.0 -97.46044,35.837972,0.0 -97.460438,35.83777,0.0 -97.460432,35.83746,0.0 -97.46044,35.837137,0.0 -97.460442,35.836915,0.0 -97.460438,35.83658,0.0 -97.460437,35.836268,0.0 -97.460437,35.836097,0.0 -97.460433,35.835915,0.0 -97.460493,35.83583,0.0 -97.460562,35.835828,0.0 -97.46065,35.835828,0.0 -97.460683,35.835833,0.0 -97.460685,35.83583,0.0 -97.460648,35.835825,0.0 -97.460635,35.835823,0.0 -97.460625,35.835822,0.0 -97.460622,35.835825,0.0 -97.460647,35.83584,0.0 -97.460682,35.835842,0.0 -97.46074,35.835843,0.0 -97.460788,35.835848,0.0 -97.46082,35.83585,0.0 -97.460837,35.835852,0.0 -97.460858,35.835853,0.0 -97.460867,35.835855,0.0 -97.460897,35.83588,0.0 -97.460908,35.835897,0.0 -97.460937,35.835943,0.0 -97.461003,35.83601,0.0 -97.46106,35.83606,0.0 -97.461147,35.836147,0.0 -97.461235,35.836238,0.0 -97.461298,35.836303,0.0 -97.461387,35.836412,0.0 -97.461462,35.836515,0.0 -97.4615,35.836585,0.0 -97.461557,35.83669,0.0 -97.461603,35.83681,0.0 -97.461623,35.83689,0.0 -97.46165,35.837015,0.0 -97.461673,35.837138,0.0 -97.46169,35.837222,0.0 -97.461713,35.837345,0.0 -97.461742,35.837467,0.0 -97.461765,35.837558,0.0 -97.46181,35.837692,0.0 -97.461893,35.837793,0.0 -97.461977,35.837842,0.0 -97.462118,35.83789,0.0 -97.462228,35.837933,0.0 -97.462302,35.837953,0.0 -97.462422,35.837992,0.0 -97.462528,35.83803,0.0 -97.462598,35.838055,0.0 -97.462715,35.838093,0.0 -97.462833,35.838113,0.0 -97.462917,35.838122,0.0 -97.463032,35.838172,0.0 -97.46311,35.838243,0.0 -97.463148,35.83828,0.0 -97.463197,35.838313,0.0 -97.46325,35.838327,0.0 -97.463283,35.83833,0.0 -97.46333,35.838328,0.0 -97.46338,35.838318,0.0 -97.463423,35.8383,0.0 -97.46349,35.838268,0.0 -97.463548,35.838245,0.0 -97.463592,35.838232,0.0 -97.463647,35.838205,0.0 -97.463675,35.838167,0.0 -97.463698,35.838142,0.0 -97.463752,35.838108,0.0 -97.463803,35.838073,0.0 -97.463842,35.838057,0.0 -97.463915,35.838042,0.0 -97.463983,35.838057,0.0 -97.46402,35.838082,0.0 -97.464038,35.838093,0.0 -97.464042,35.838088,0.0 -97.464182,35.8379,0.0 -97.464173,35.837885,0.0 -97.464172,35.837878,0.0 -97.464158,35.837852,0.0 -97.464155,35.837842,0.0 -97.464168,35.837842,0.0 -97.4642,35.837843,0.0 -97.464203,35.837845,0.0 -97.464182,35.83783,0.0 -97.46415,35.837825,0.0 -97.464148,35.837825,0.0 -97.464182,35.8378,0.0 -97.464188,35.83776,0.0 -97.46419,35.83772,0.0 -97.464183,35.837647,0.0 -97.464172,35.837568,0.0 -97.464153,35.837513,0.0 -97.464115,35.837433,0.0 -97.464082,35.837353,0.0 -97.464057,35.8373,0.0 -97.464015,35.83722,0.0 -97.46395,35.83715,0.0 -97.4639,35.83711,0.0 -97.463815,35.837055,0.0 -97.463728,35.83699,0.0 -97.463672,35.83694,0.0 -97.463598,35.836858,0.0 -97.46354,35.836763,0.0 -97.4635,35.836702,0.0 -97.463438,35.83662,0.0 -97.463412,35.836538,0.0 -97.463397,35.836483,0.0 -97.463355,35.836403,0.0 -97.463303,35.836332,0.0 -97.46326,35.836278,0.0 -97.4632,35.836202,0.0 -97.463138,35.836125,0.0 -97.463095,35.83607,0.0 -97.463015,35.836005,0.0 -97.462907,35.83598,0.0 -97.462825,35.835968,0.0 -97.462703,35.835945,0.0 -97.462602,35.835928,0.0 -97.462528,35.835927,0.0 -97.462413,35.83593,0.0 -97.4623,35.835933,0.0 -97.462213,35.83593,0.0 -97.462055,35.835918,0.0 -97.46189,35.835908,0.0 -97.461802,35.835903,0.0 -97.461693,35.835897,0.0 -97.461567,35.8359,0.0 -97.461478,35.835898,0.0 -97.461333,35.835892,0.0 -97.461193,35.835888,0.0 -97.461113,35.835888,0.0 -97.460993,35.835888,0.0 -97.46089,35.835885,0.0 -97.460847,35.835885,0.0 -97.460832,35.835885,0.0 -97.460858,35.835888,0.0 -97.460878,35.835887,0.0 -97.460885,35.835887,0.0 -97.460888,35.835883,0.0 -97.46085,35.835892,0.0 -97.460743,35.835892,0.0 -97.46063,35.835903,0.0 -97.460592,35.835907,0.0 -97.460572,35.835912,0.0 -97.460457,35.835952,0.0 -97.460448,35.836067,0.0 -97.46045,35.836195,0.0 -97.460452,35.83643,0.0 -97.460447,35.8367,0.0 -97.460448,35.836892,0.0 -97.46045,35.837188,0.0 -97.46045,35.837498,0.0 -97.460448,35.837708,0.0 -97.460448,35.838032,0.0 -97.460448,35.838367,0.0 -97.460447,35.838587,0.0 -97.460447,35.838932,0.0 -97.460443,35.8393,0.0 -97.460442,35.839547,0.0 -97.460442,35.83991,0.0 -97.460447,35.840258,0.0 -97.460447,35.840482,0.0 -97.46045,35.840805,0.0 -97.46045,35.841105,0.0 -97.460447,35.841288,0.0 -97.460443,35.841508,0.0 -97.460378,35.841635,0.0 -97.460265,35.841665,0.0 -97.459988,35.841673,0.0 -97.459635,35.84168,0.0 -97.459385,35.841678,0.0 -97.459037,35.84168,0.0 -97.458697,35.841683,0.0 -97.458465,35.841685,0.0 -97.458162,35.841675,0.0 -97.457975,35.841668,0.0 -97.457932,35.841667,0.0 -97.457952,35.84166,0.0 -97.457992,35.841658,0.0 -97.458053,35.841653,0.0 -97.458133,35.841648,0.0 -97.458228,35.84165,0.0 -97.458297,35.84165,0.0 -97.458387,35.841648,0.0 -97.458455,35.841645,0.0 -97.458495,35.84164,0.0 -97.458555,35.841627,0.0 -97.458587,35.841622,0.0 -97.458578,35.841642,0.0 -97.458552,35.841647,0.0 -97.458487,35.841657,0.0 -97.458388,35.841663,0.0 -97.458293,35.84166,0.0 -97.45812,35.841663,0.0 -97.45792,35.841667,0.0 -97.457765,35.84167,0.0 -97.45749,35.841673,0.0 -97.45718,35.841677,0.0 -97.45696,35.841678,0.0 -97.456603,35.841675,0.0 -97.456248,35.841672,0.0 -97.456025,35.84167,0.0 -97.455687,35.841672,0.0 -97.455365,35.841673,0.0 -97.455152,35.841675,0.0 -97.454827,35.841682,0.0 -97.454478,35.841683,0.0 -97.454238,35.841685,0.0 -97.453857,35.841683,0.0 -97.453458,35.841683,0.0 -97.453198,35.84168,0.0 -97.452815,35.841675,0.0 -97.452462,35.841667,0.0 -97.452255,35.841665,0.0 -97.452018,35.841673,0.0 -97.451862,35.841745,0.0 -97.451827,35.841843,0.0 -97.451845,35.84207,0.0 -97.451855,35.842332,0.0 -97.451858,35.842505,0.0 -97.451863,35.842745,0.0 -97.451865,35.842978,0.0 -97.451863,35.843137,0.0 -97.451862,35.843372,0.0 -97.451863,35.843602,0.0 -97.45187,35.843757,0.0 -97.451875,35.843993,0.0 -97.451877,35.844248,0.0 -97.451878,35.844418,0.0 -97.451878,35.844647,0.0 -97.451872,35.844768,0.0 -97.451867,35.844785,0.0 -97.45184,35.844762,0.0 -97.451847,35.844837,0.0 -97.451848,35.844973,0.0 -97.451848,35.845083,0.0 -97.451847,35.84528,0.0 -97.451847,35.84551,0.0 -97.451847,35.84567,0.0 -97.451852,35.845937,0.0 -97.451853,35.84623,0.0 -97.451852,35.846432,0.0 -97.451848,35.84674,0.0 -97.451842,35.847063,0.0 -97.451837,35.847283,0.0 -97.451833,35.847595,0.0 -97.45183,35.84791,0.0 -97.451828,35.848117,0.0 -97.451832,35.848415,0.0 -97.451833,35.848707,0.0 -97.451833,35.8489,0.0 -97.451837,35.849207,0.0 -97.451835,35.849528,0.0 -97.451832,35.849752,0.0 -97.451832,35.850082,0.0 -97.451832,35.850405,0.0 -97.45183,35.850612,0.0 -97.451818,35.850932,0.0 -97.451812,35.851245,0.0 -97.451805,35.851467,0.0 -97.451792,35.8518,0.0 -97.451785,35.852148,0.0 -97.451778,35.852387,0.0 -97.451775,35.85275,0.0 -97.451777,35.853112,0.0 -97.45178,35.853352,0.0 -97.451787,35.853725,0.0 -97.451795,35.854102,0.0 -97.451795,35.854337,0.0 -97.451798,35.85467,0.0 -97.45181,35.854978,0.0 -97.45181,35.855183,0.0 -97.451812,35.855502,0.0 -97.451817,35.855782,0.0 -97.45182,35.855923,0.0 -97.451787,35.856077,0.0 -97.451653,35.856148,0.0 -97.45149,35.856143,0.0 -97.451168,35.856137,0.0 -97.450803,35.856133,0.0 -97.450542,35.856133,0.0 -97.450138,35.856137,0.0 -97.449725,35.85613,0.0 -97.449438,35.856128,0.0 -97.449005,35.856137,0.0 -97.448583,35.856163,0.0 -97.448307,35.856202,0.0 -97.447912,35.856272,0.0 -97.44754,35.856338,0.0 -97.447293,35.856382,0.0 -97.446918,35.856448,0.0 -97.446543,35.856518,0.0 -97.446295,35.856565,0.0 -97.445925,35.856632,0.0 -97.445522,35.856698,0.0 -97.445248,35.856738,0.0 -97.444838,35.856782,0.0 -97.44443,35.856795,0.0 -97.444163,35.856768,0.0 -97.443768,35.856703,0.0 -97.443422,35.856635,0.0 -97.443213,35.856577,0.0 -97.442905,35.85648,0.0 -97.442607,35.856388,0.0 -97.442405,35.856333,0.0 -97.442105,35.856275,0.0 -97.441803,35.856228,0.0 -97.441595,35.856203,0.0 -97.441272,35.856193,0.0 -97.440947,35.856193,0.0 -97.440735,35.856193,0.0 -97.44042,35.856198,0.0 -97.440107,35.856208,0.0 -97.439888,35.85621,0.0 -97.439567,35.856215,0.0 -97.43925,35.85622,0.0 -97.43906,35.85622,0.0 -97.438808,35.856223,0.0 -97.43859,35.85622,0.0 -97.438462,35.85622,0.0 -97.438303,35.856223,0.0 -97.438207,35.8562,0.0 -97.43818,35.856162,0.0 -97.438165,35.856058,0.0 -97.438143,35.855917,0.0 -97.438128,35.855802,0.0 -97.438113,35.855615,0.0 -97.438105,35.855432,0.0 -97.438102,35.855312,0.0 -97.438098,35.855125,0.0 -97.4381,35.854933,0.0 -97.438102,35.854802,0.0 -97.438103,35.8546,0.0 -97.4381,35.854392,0.0 -97.438095,35.854245,0.0 -97.438093,35.854015,0.0 -97.438095,35.853778,0.0 -97.438097,35.85362,0.0 -97.438093,35.853393,0.0 -97.438092,35.853172,0.0 -97.438088,35.853025,0.0 -97.438082,35.852807,0.0 -97.43808,35.85259,0.0 -97.438078,35.85245,0.0 -97.438075,35.852252,0.0 -97.438073,35.852077,0.0 -97.438072,35.85197,0.0 -97.43807,35.851878,0.0 -97.438063,35.851872,0.0 -97.438058,35.851827,0.0 -97.43806,35.851807,0.0 -97.438058,35.8518,0.0 -97.438115,35.851837,0.0 -97.438117,35.851877,0.0 -97.438117,35.851907,0.0 -97.438115,35.851953,0.0 -97.438115,35.851998,0.0 -97.438117,35.852023,0.0 -97.438117,35.85205,0.0 -97.438113,35.852058,0.0 -97.43809,35.852085,0.0 -97.438085,35.8521,0.0 -97.43809,35.852102,0.0 -97.438103,35.852073,0.0 -97.438102,35.852082,0.0 -97.4381,35.852122,0.0 -97.438098,35.852192,0.0 -97.438098,35.852218,0.0 -97.4381,35.852213,0.0 -97.438088,35.852198,0.0 -97.438083,35.8522,0.0 -97.438057,35.852195,0.0 -97.438017,35.852192,0.0 -97.43799,35.852195,0.0 -97.437937,35.85219,0.0 -97.437875,35.85219,0.0 -97.437835,35.852187,0.0 -97.437775,35.85216,0.0 -97.437757,35.852105,0.0 -97.43775,35.852075,0.0 -97.437738,35.85203,0.0 -97.43772,35.852,0.0 -97.437697,35.851988,0.0 -97.437652,35.851985,0.0 -97.437602,35.851982,0.0 -97.43758,35.851978,0.0 -97.437583,35.851975,0.0 -97.437522,35.851985,0.0 -97.437452,35.852043,0.0 -97.437408,35.852095,0.0 -97.437335,35.852182,0.0 -97.43726,35.852272,0.0 -97.437207,35.852345,0.0 -97.43713,35.852465,0.0 -97.437065,35.852592,0.0 -97.437023,35.85268,0.0 -97.436973,35.852807,0.0 -97.436925,35.852922,0.0 -97.436882,35.852987,0.0 -97.436787,35.85305,0.0 -97.43668,35.853072,0.0 -97.436618,35.853068,0.0 -97.43653,35.853075,0.0 -97.436492,35.853113,0.0 -97.436488,35.853117,0.0 -97.436493,35.853112,0.0 -97.436497,35.853103,0.0 -97.436507,35.853137,0.0 -97.436567,35.85312,0.0 -97.436635,35.853055,0.0 -97.436753,35.852983,0.0 -97.43683,35.852918,0.0 -97.436902,35.85279,0.0 -97.436972,35.85264,0.0 -97.437018,35.852538,0.0 -97.4371,35.852385,0.0 -97.437198,35.852248,0.0 -97.437262,35.852167,0.0 -97.437357,35.852045,0.0 -97.437448,35.851965,0.0 -97.437527,35.851948,0.0 -97.437662,35.851945,0.0 -97.437745,35.851992,0.0 -97.43775,35.852032,0.0 -97.43775,35.85212,0.0 -97.437817,35.852172,0.0 -97.437868,35.852168,0.0 -97.437943,35.85216,0.0 -97.438015,35.852155,0.0 -97.43806,35.85217,0.0 -97.438088,35.85223,0.0 -97.438078,35.852335,0.0 -97.438077,35.852438,0.0 -97.438075,35.852627,0.0 -97.438073,35.85283,0.0 -97.438073,35.852972,0.0 -97.43808,35.85319,0.0 -97.438082,35.853413,0.0 -97.438087,35.85357,0.0 -97.438093,35.853807,0.0 -97.438097,35.854058,0.0 -97.438098,35.85423,0.0 -97.438102,35.854488,0.0 -97.438103,35.85475,0.0 -97.438102,35.85493,0.0 -97.4381,35.855193,0.0 -97.438107,35.855445,0.0 -97.438115,35.85561,0.0 -97.438137,35.85584,0.0 -97.43816,35.856033,0.0 -97.43817,35.856115,0.0 -97.438187,35.856182,0.0 -97.438132,35.856233,0.0 -97.438052,35.856228,0.0 -97.43789,35.856212,0.0 -97.437643,35.856208,0.0 -97.437425,35.856208,0.0 -97.437023,35.856205,0.0 -97.436572,35.856198,0.0 -97.436267,35.8562,0.0 -97.435803,35.856203,0.0 -97.43531,35.856203,0.0 -97.434962,35.856202,0.0 -97.434432,35.856197,0.0 -97.433912,35.8562,0.0 -97.433577,35.856202,0.0 -97.433077,35.856205,0.0 -97.432578,35.856207,0.0 -97.432243,35.856208,0.0 -97.431748,35.856207,0.0 -97.43125,35.856203,0.0 -97.43092,35.856205,0.0 -97.43043,35.856208,0.0 -97.429948,35.85621,0.0 -97.429627,35.856208,0.0 -97.429123,35.856207,0.0 -97.428617,35.856205,0.0 -97.428283,35.856205,0.0 -97.427802,35.8562,0.0 -97.42735,35.856203,0.0 -97.427088,35.856203,0.0 -97.426765,35.85621,0.0 -97.426542,35.856217,0.0 -97.426435,35.856212,0.0 -97.426368,35.856165,0.0 -97.426383,35.856003,0.0 -97.426395,35.855862,0.0 -97.426367,35.855683,0.0 -97.426237,35.855572,0.0 -97.426105,35.855575,0.0 -97.4259,35.855588,0.0 -97.425728,35.855598,0.0 -97.425683,35.855607,0.0 -97.425685,35.855617,0.0 -97.42569,35.855618,0.0 -97.425647,35.855623,0.0 -97.425623,35.855663,0.0 -97.425588,35.85567,0.0 -97.42553,35.855625,0.0 -97.425538,35.855558,0.0 -97.425563,35.855525,0.0 -97.42558,35.855508,0.0 -97.425572,35.855503,0.0 -97.425488,35.855445,0.0 -97.425482,35.855317,0.0 -97.425473,35.855178,0.0 -97.425453,35.85492,0.0 -97.425458,35.85471,0.0 -97.425478,35.854642,0.0 -97.425477,35.854652,0.0 -97.425457,35.854667,0.0 -97.425378,35.854622,0.0 -97.425295,35.854635,0.0 -97.425208,35.854712,0.0 -97.425177,35.854825,0.0 -97.42521,35.854915,0.0 -97.425305,35.854978,0.0 -97.425347,35.855,0.0 -97.42538,35.855053,0.0 -97.42538,35.855265,0.0 -97.425372,35.855578,0.0 -97.425365,35.855812,0.0 -97.425362,35.856182,0.0 -97.425365,35.856568,0.0 -97.425372,35.856842,0.0 -97.425377,35.857268,0.0 -97.425372,35.857718,0.0 -97.425373,35.858027,0.0 -97.425372,35.858515,0.0 -97.42537,35.859,0.0 -97.42537,35.859318,0.0 -97.425367,35.859783,0.0 -97.425367,35.86023,0.0 -97.425367,35.860517,0.0 -97.425363,35.860937,0.0 -97.425358,35.861297,0.0 -97.425355,35.861485,0.0 -97.42535,35.861688,0.0 -97.425288,35.86177,0.0 -97.42523,35.86176,0.0 -97.425195,35.861705,0.0 -97.425188,35.861655,0.0 -97.425187,35.861635,0.0 -97.425185,35.861652,0.0 -97.42518,35.861685,0.0 -97.42517,35.861672,0.0 -97.425163,35.86164,0.0 -97.42516,35.861613,0.0 -97.425155,35.861603,0.0 -97.425153,35.8616,0.0 -97.425182,35.861632,0.0 -97.425163,35.861665,0.0 -97.425143,35.861683,0.0 -97.425142,35.861687,0.0 -97.425167,35.861705,0.0 -97.425183,35.861752,0.0 -97.425185,35.86185,0.0 -97.425255,35.861925,0.0 -97.425297,35.861938,0.0 -97.425348,35.861997,0.0 -97.425285,35.862068,0.0 -97.425215,35.86208,0.0 -97.42512,35.862128,0.0 -97.42511,35.862222,0.0 -97.425128,35.862273,0.0 -97.425177,35.862308,0.0 -97.425202,35.862308,0.0 -97.425238,35.862297,0.0 -97.414158,35.85748,0.0 -97.414168,35.857448,0.0 -97.396097,35.858605,0.0 -97.39602,35.85868,0.0 -97.395985,35.858713,0.0 -97.395945,35.858773,0.0 -97.395938,35.858805,0.0 -97.395938,35.858813,0.0 -97.395943,35.8588,0.0 -97.39595,35.858827,0.0 -97.395952,35.858847,0.0 -97.395965,35.858853,0.0 -97.396012,35.85894,0.0 -97.396017,35.8589,0.0 -97.396018,35.858937,0.0 -97.396018,35.85904,0.0 -97.396015,35.859185,0.0 -97.396012,35.859305,0.0 -97.39601,35.85949,0.0 -97.396012,35.859667,0.0 -97.396012,35.859792,0.0 -97.396007,35.859988,0.0 -97.39601,35.860197,0.0 -97.39601,35.860345,0.0 -97.396012,35.860577,0.0 -97.396005,35.860835,0.0 -97.396012,35.861018,0.0 -97.396015,35.861307,0.0 -97.396008,35.861605,0.0 -97.39605,35.86177,0.0 -97.396212,35.861925,0.0 -97.396438,35.861957,0.0 -97.396605,35.861962,0.0 -97.396867,35.861965,0.0 -97.39712,35.861968,0.0 -97.397272,35.861973,0.0 -97.397475,35.862012,0.0 -97.397618,35.862117,0.0 -97.397647,35.862217,0.0 -97.397633,35.86238,0.0 -97.397623,35.862555,0.0 -97.397627,35.862683,0.0 -97.397628,35.862895,0.0 -97.397637,35.863103,0.0 -97.39764,35.863225,0.0 -97.397638,35.863377,0.0 -97.397613,35.863462,0.0 -97.39756,35.86349,0.0 -97.397428,35.863498,0.0 -97.397248,35.863503,0.0 -97.3971,35.863503,0.0 -97.396832,35.863495,0.0 -97.39651,35.863487,0.0 -97.39628,35.863487,0.0 -97.395915,35.863478,0.0 -97.395537,35.863475,0.0 -97.395278,35.863473,0.0 -97.39489,35.863475,0.0 -97.394498,35.863475,0.0 -97.39424,35.863475,0.0 -97.393822,35.863478,0.0 -97.393383,35.863482,0.0 -97.393088,35.86348,0.0 -97.392647,35.863477,0.0 -97.392215,35.86347,0.0 -97.391937,35.863468,0.0 -97.391542,35.863462,0.0 -97.39117,35.86346,0.0 -97.390925,35.86346,0.0 -97.390555,35.863453,0.0 -97.390207,35.863448,0.0 -97.390013,35.86344,0.0 -97.389817,35.86343,0.0 -97.38973,35.86344,0.0 -97.389668,35.863448,0.0 -97.389513,35.86347,0.0 -97.389278,35.863475,0.0 -97.389092,35.86347,0.0 -97.38878,35.863458,0.0 -97.388447,35.863458,0.0 -97.388208,35.863452,0.0 -97.38785,35.863442,0.0 -97.387488,35.863438,0.0 -97.387228,35.86343,0.0 -97.386817,35.863418,0.0 -97.386403,35.863407,0.0 -97.386148,35.863407,0.0 -97.385793,35.863405,0.0 -97.385468,35.863398,0.0 -97.385245,35.863387,0.0 -97.384903,35.863385,0.0 -97.38459,35.86339,0.0 -97.384382,35.863392,0.0 -97.384035,35.863388,0.0 -97.38366,35.863383,0.0 -97.383427,35.863388,0.0 -97.383072,35.863382,0.0 -97.382703,35.863373,0.0 -97.382452,35.863368,0.0 -97.382127,35.863362,0.0 -97.381863,35.863352,0.0 -97.381712,35.863347,0.0 -97.381515,35.863343,0.0 -97.38133,35.863337,0.0 -97.381227,35.863337,0.0 -97.381072,35.863338,0.0 -97.380918,35.86333,0.0 -97.38083,35.863325,0.0 -97.38073,35.863335,0.0 -97.380647,35.863338,0.0 -97.380615,35.863342,0.0 -97.38061,35.863345,0.0 -97.380603,35.863342,0.0 -97.380597,35.86334,0.0 -97.380587,35.863338,0.0 -97.380683,35.863387,0.0 -97.380687,35.863388,0.0 -97.38069,35.86339,0.0 -97.380572,35.863338,0.0 -97.380473,35.863335,0.0 -97.380315,35.863333,0.0 -97.380105,35.863335,0.0 -97.37994,35.863337,0.0 -97.379707,35.863342,0.0 -97.379457,35.863343,0.0 -97.379278,35.863343,0.0 -97.378967,35.863343,0.0 -97.378582,35.863343,0.0 -97.378307,35.863343,0.0 -97.377892,35.863345,0.0 -97.377472,35.863347,0.0 -97.377188,35.863347,0.0 -97.37677,35.86334,0.0 -97.376357,35.863343,0.0 -97.376078,35.863342,0.0 -97.375675,35.863342,0.0 -97.375263,35.863343,0.0 -97.374968,35.863345,0.0 -97.374522,35.863345,0.0 -97.374085,35.863345,0.0 -97.373795,35.863348,0.0 -97.37334,35.863345,0.0 -97.372893,35.863335,0.0 -97.37263,35.86332,0.0 -97.372283,35.863267,0.0 -97.372017,35.863207,0.0 -97.371917,35.863193,0.0 -97.371842,35.863218,0.0 -97.371787,35.863313,0.0 -97.371785,35.86344,0.0 -97.371803,35.863715,0.0 -97.371822,35.864033,0.0 -97.371837,35.86427,0.0 -97.371837,35.86463,0.0 -97.371837,35.864993,0.0 -97.37184,35.865248,0.0 -97.37185,35.865625,0.0 -97.371855,35.865985,0.0 -97.371855,35.866195,0.0 -97.371855,35.86648,0.0 -97.371852,35.866725,0.0 -97.371853,35.866862,0.0 -97.371845,35.866985,0.0 -97.371817,35.866998,0.0 -97.371813,35.866993,0.0 -97.371777,35.867005,0.0 -97.37174,35.867015,0.0 -97.371723,35.867015,0.0 -97.371702,35.867023,0.0 -97.371703,35.867027,0.0 -97.371627,35.867045,0.0 -97.371563,35.867055,0.0 -97.371448,35.867073,0.0 -97.371318,35.867097,0.0 -97.371235,35.867118,0.0 -97.371085,35.86715,0.0 -97.370932,35.86718,0.0 -97.370835,35.867193,0.0 -97.370695,35.867208,0.0 -97.370535,35.867217,0.0 -97.37042,35.86722,0.0 -97.37026,35.867238,0.0 -97.370112,35.867257,0.0 -97.370012,35.867262,0.0 -97.369887,35.867267,0.0 -97.369823,35.867295,0.0 -97.369823,35.867312,0.0 -97.369827,35.867325,0.0 -97.369838,35.867317,0.0 -97.36984,35.86734,0.0 -97.369842,35.867365,0.0 -97.369843,35.867385,0.0 -97.369845,35.867392,0.0 -97.369862,35.867405,0.0 -97.369863,35.867392,0.0 -97.369865,35.867368,0.0 -97.36986,35.867352,0.0 -97.369855,35.867342,0.0 -97.369848,35.867325,0.0 -97.369837,35.867305,0.0 -97.369825,35.867288,0.0 -97.369815,35.86728,0.0 -97.369833,35.867282,0.0 -97.369893,35.867277,0.0 -97.369947,35.867272,0.0 -97.37003,35.86724,0.0 -97.370108,35.867188,0.0 -97.370158,35.867153,0.0 -97.370225,35.867125,0.0 -97.37026,35.867128,0.0 -97.370262,35.867127,0.0 -97.37019,35.867107,0.0 -97.370148,35.867123,0.0 -97.370103,35.867155,0.0 -97.37008,35.867172,0.0 -97.370053,35.867197,0.0 -97.370013,35.867223,0.0 -97.369985,35.86724,0.0 -97.369982,35.867252,0.0 -97.370048,35.867253,0.0 -97.37013,35.867247,0.0 -97.370262,35.86723,0.0 -97.370405,35.867217,0.0 -97.370512,35.86721,0.0 -97.37068,35.867195,0.0 -97.370838,35.86717,0.0 -97.370937,35.867152,0.0 -97.371095,35.86712,0.0 -97.371253,35.867082,0.0 -97.371353,35.867058,0.0 -97.371463,35.867042,0.0 -97.371577,35.867027,0.0 -97.371648,35.867018,0.0 -97.371728,35.867008,0.0 -97.371798,35.866998,0.0 -97.371827,35.867002,0.0 -97.371862,35.867035,0.0 -97.371873,35.867117,0.0 -97.371873,35.867197,0.0 -97.371875,35.86735,0.0 -97.371877,35.867548,0.0 -97.371877,35.867692,0.0 -97.371867,35.86789,0.0 -97.371865,35.868092,0.0 -97.371863,35.868222,0.0 -97.37186,35.868407,0.0 -97.371858,35.86859,0.0 -97.371855,35.868737,0.0 -97.371857,35.868973,0.0 -97.371858,35.869223,0.0 -97.371853,35.869393,0.0 -97.37185,35.869653,0.0 -97.371855,35.86991,0.0 -97.37186,35.870078,0.0 -97.371858,35.870307,0.0 -97.371863,35.870538,0.0 -97.371867,35.8707,0.0 -97.371872,35.870947,0.0 -97.371877,35.871183,0.0 -97.37188,35.871328,0.0 -97.371892,35.871542,0.0 -97.371887,35.871748,0.0 -97.371882,35.871893,0.0 -97.37188,35.872122,0.0 -97.37188,35.87236,0.0 -97.371887,35.872537,0.0 -97.371888,35.872813,0.0 -97.371888,35.8731,0.0 -97.371885,35.87329,0.0 -97.371878,35.87357,0.0 -97.37188,35.873842,0.0 -97.371873,35.874018,0.0 -97.371867,35.874287,0.0 -97.371863,35.874552,0.0 -97.37186,35.874728,0.0 -97.371863,35.874988,0.0 -97.371855,35.875243,0.0 -97.371853,35.875417,0.0 -97.37185,35.875672,0.0 -97.371848,35.875915,0.0 -97.371847,35.876065,0.0 -97.371853,35.876285,0.0 -97.371853,35.876515,0.0 -97.371847,35.876668,0.0 -97.371853,35.876907,0.0 -97.371867,35.877135,0.0 -97.371867,35.877272,0.0 -97.371872,35.877458,0.0 -97.37188,35.877645,0.0 -97.371888,35.877753,0.0 -97.371903,35.877837,0.0 -97.371915,35.877857,0.0 -97.371917,35.87786,0.0 -97.37192,35.877868,0.0 -97.371908,35.877892,0.0 -97.371878,35.877907,0.0 -97.371777,35.8779,0.0 -97.37158,35.877877,0.0 -97.371388,35.877868,0.0 -97.371023,35.877862,0.0 -97.370583,35.877855,0.0 -97.370273,35.877848,0.0 -97.369812,35.877833,0.0 -97.369338,35.877805,0.0 -97.369017,35.877772,0.0 -97.368517,35.87769,0.0 -97.368003,35.877567,0.0 -97.367647,35.877468,0.0 -97.367117,35.877288,0.0 -97.366615,35.877058,0.0 -97.366285,35.87689,0.0 -97.365815,35.87659,0.0 -97.365375,35.876255,0.0 -97.365083,35.87603,0.0 -97.364652,35.875693,0.0 -97.364232,35.875367,0.0 -97.363967,35.875158,0.0 -97.363595,35.874872,0.0 -97.363222,35.874585,0.0 -97.362977,35.874393,0.0 -97.362602,35.874102,0.0 -97.362233,35.87381,0.0 -97.361992,35.873627,0.0 -97.361642,35.873365,0.0 -97.361323,35.873123,0.0 -97.361147,35.872987,0.0 -97.360928,35.872875,0.0 -97.360763,35.872935,0.0 -97.360647,35.873008,0.0 -97.360423,35.873147,0.0 -97.360168,35.873292,0.0 -97.359988,35.873382,0.0 -97.359722,35.873523,0.0 -97.359457,35.873662,0.0 -97.359292,35.873748,0.0 -97.359058,35.87386,0.0 -97.358828,35.873973,0.0 -97.358672,35.874052,0.0 -97.358425,35.87417,0.0 -97.35818,35.874283,0.0 -97.35802,35.874358,0.0 -97.357782,35.874473,0.0 -97.357537,35.874587,0.0 -97.357382,35.874667,0.0 -97.357157,35.874775,0.0 -97.35693,35.874878,0.0 -97.356788,35.874945,0.0 -97.356575,35.875047,0.0 -97.356363,35.875148,0.0 -97.356228,35.87521,0.0 -97.356035,35.875293,0.0 -97.355865,35.875377,0.0 -97.35576,35.875427,0.0 -97.355638,35.875485,0.0 -97.35558,35.875512,0.0 -97.355562,35.875517,0.0 -97.355568,35.87552,0.0 -97.35546,35.87551,0.0 -97.355383,35.875493,0.0 -97.355453,35.875468,0.0 -97.355525,35.875437,0.0 -97.35557,35.875435,0.0 -97.355652,35.875432,0.0 -97.355722,35.875413,0.0 -97.355785,35.875395,0.0 -97.35587,35.875363,0.0 -97.355888,35.875332,0.0 -97.355888,35.875318,0.0 -97.35591,35.875325,0.0 -97.355957,35.875322,0.0 -97.355995,35.875303,0.0 -97.356097,35.875257,0.0 -97.356295,35.875167,0.0 -97.356448,35.875092,0.0 -97.356692,35.874973,0.0 -97.356955,35.874848,0.0 -97.35714,35.87476,0.0 -97.357453,35.874607,0.0 -97.357792,35.874452,0.0 -97.358032,35.874343,0.0 -97.358403,35.874172,0.0 -97.358763,35.873997,0.0 -97.358992,35.873883,0.0 -97.35933,35.87372,0.0 -97.359697,35.873543,0.0 -97.359952,35.87342,0.0 -97.360327,35.873235,0.0 -97.360663,35.873073,0.0 -97.360823,35.872992,0.0 -97.360952,35.872913,0.0 -97.360977,35.872838,0.0 -97.360915,35.872757,0.0 -97.36069,35.872598,0.0 -97.360373,35.872355,0.0 -97.360113,35.872158,0.0 -97.35967,35.871832,0.0 -97.35918,35.87148,0.0 -97.358833,35.871262,0.0 -97.3583,35.870973,0.0 -97.357735,35.870745,0.0 -97.35734,35.870622,0.0 -97.356737,35.870475,0.0 -97.356098,35.87037,0.0 -97.35565,35.870315,0.0 -97.354967,35.870285,0.0 -97.354272,35.87028,0.0 -97.353813,35.870283,0.0 -97.353137,35.870275,0.0 -97.352485,35.870262,0.0 -97.352048,35.870257,0.0 -97.351368,35.87025,0.0 -97.350657,35.870248,0.0 -97.350163,35.870242,0.0 -97.349432,35.870235,0.0 -97.348717,35.870232,0.0 -97.348242,35.870228,0.0 -97.347513,35.87022,0.0 -97.34675,35.87021,0.0 -97.346228,35.870205,0.0 -97.345445,35.8702,0.0 -97.34466,35.870192,0.0 -97.34413,35.870187,0.0 -97.343322,35.870173,0.0 -97.342512,35.870162,0.0 -97.34198,35.870157,0.0 -97.341193,35.87015,0.0 -97.340425,35.870147,0.0 -97.33992,35.870142,0.0 -97.33915,35.870133,0.0 -97.338365,35.870125,0.0 -97.337828,35.870122,0.0 -97.337062,35.870115,0.0 -97.336462,35.870112,0.0 -97.336173,35.870103,0.0 -97.335907,35.870112,0.0 -97.335813,35.870202,0.0 -97.335813,35.870307,0.0 -97.335823,35.870518,0.0 -97.335818,35.870753,0.0 -97.335813,35.870923,0.0 -97.335812,35.87118,0.0 -97.335815,35.871437,0.0 -97.335818,35.87161,0.0 -97.33582,35.871883,0.0 -97.335817,35.872162,0.0 -97.335817,35.872348,0.0 -97.335815,35.87264,0.0 -97.335808,35.872932,0.0 -97.335817,35.873143,0.0 -97.335818,35.873468,0.0 -97.335822,35.873808,0.0 -97.335828,35.874058,0.0 -97.335832,35.874452,0.0 -97.33583,35.87487,0.0 -97.335833,35.875147,0.0 -97.335835,35.875558,0.0 -97.335837,35.875952,0.0 -97.33583,35.876212,0.0 -97.335828,35.876565,0.0 -97.335842,35.87692,0.0 -97.335843,35.877168,0.0 -97.33586,35.877545,0.0 -97.33587,35.877928,0.0 -97.335875,35.878187,0.0 -97.335882,35.878543,0.0 -97.335883,35.878875,0.0 -97.335877,35.87909,0.0 -97.33587,35.879417,0.0 -97.335865,35.879732,0.0 -97.335867,35.87993,0.0 -97.33586,35.880195,0.0 -97.335855,35.88041,0.0 -97.335857,35.880527,0.0 -97.335865,35.880635,0.0 -97.335928,35.880658,0.0 -97.335977,35.88066,0.0 -97.336072,35.880657,0.0 -97.336138,35.88065,0.0 -97.336147,35.880647,0.0 -97.336105,35.880622,0.0 -97.336063,35.880623,0.0 -97.336045,35.880627,0.0 -97.336037,35.880635,0.0 -97.336013,35.88064,0.0 -97.335967,35.880648,0.0 -97.335913,35.880647,0.0 -97.33588,35.880648,0.0 -97.335825,35.880652,0.0 -97.335818,35.880647,0.0 -97.335822,35.880618,0.0 -97.335815,35.880527,0.0 -97.335807,35.880387,0.0 -97.335805,35.88029,0.0 -97.3358,35.880158,0.0 -97.335808,35.880087,0.0 -97.335827,35.880067,0.0 -97.33588,35.880032,0.0 -97.335933,35.880022,0.0 -97.335967,35.88002,0.0 -97.336038,35.880015,0.0 -97.336095,35.880015,0.0 -97.336137,35.88002,0.0 -97.336242,35.880025,0.0 -97.336373,35.880042,0.0 -97.33647,35.88005,0.0 -97.336625,35.880058,0.0 -97.336783,35.880055,0.0 -97.336887,35.880048,0.0 -97.337042,35.880035,0.0 -97.337198,35.880028,0.0 -97.337302,35.88003,0.0 -97.337485,35.880022,0.0 -97.33765,35.879993,0.0 -97.337742,35.879967,0.0 -97.337872,35.879927,0.0 -97.338007,35.879902,0.0 -97.338093,35.879902,0.0 -97.338178,35.879917,0.0 -97.338268,35.879952,0.0 -97.338348,35.879985,0.0 -97.338483,35.880047,0.0 -97.338617,35.88012,0.0 -97.33871,35.88018,0.0 -97.338855,35.880278,0.0 -97.338983,35.880382,0.0 -97.339072,35.880457,0.0 -97.339215,35.880572,0.0 -97.339373,35.880682,0.0 -97.339482,35.88075,0.0 -97.339642,35.880845,0.0 -97.339803,35.880938,0.0 -97.339918,35.881,0.0 -97.340102,35.881095,0.0 -97.340285,35.881178,0.0 -97.340412,35.88123,0.0 -97.34061,35.881312,0.0 -97.340802,35.881393,0.0 -97.340927,35.881443,0.0 -97.341078,35.8815,0.0 -97.341165,35.88153,0.0 -97.341195,35.881552,0.0 -97.341198,35.881567,0.0 -97.341193,35.881568,0.0 -97.341175,35.88156,0.0 -97.341113,35.881525,0.0 -97.341047,35.881505,0.0 -97.341012,35.881497,0.0 -97.34102,35.881502,0.0 -97.341032,35.881542,0.0 -97.341035,35.881583,0.0 -97.341043,35.881665,0.0 -97.34105,35.881748,0.0 -97.341052,35.881805,0.0 -97.341053,35.88188,0.0 -97.341055,35.881952,0.0 -97.34106,35.881993,0.0 -97.341068,35.882018,0.0 -97.34107,35.882003,0.0 -97.341067,35.881982,0.0 -97.341057,35.88196,0.0 -97.341042,35.88194,0.0 -97.341035,35.881932,0.0 -97.341075,35.881933,0.0 -97.341128,35.881895,0.0 -97.341155,35.881852,0.0 -97.341147,35.881785,0.0 -97.341142,35.88177,0.0 -97.341145,35.881748,0.0 -97.34109,35.881683,0.0 -97.341063,35.881608,0.0 -97.34107,35.881583,0.0 -97.341087,35.881565,0.0 -97.341098,35.881555,0.0 -97.341115,35.88155,0.0 -97.34115,35.881558,0.0 -97.341193,35.88158,0.0 -97.341228,35.881617,0.0 -97.341297,35.881698,0.0 -97.34138,35.881813,0.0 -97.341442,35.881902,0.0 -97.341528,35.882047,0.0 -97.341625,35.8822,0.0 -97.341693,35.882302,0.0 -97.341787,35.88245,0.0 -97.341863,35.882572,0.0 -97.341915,35.882655,0.0 -97.341995,35.882782,0.0 -97.342068,35.882917,0.0 -97.342115,35.882995,0.0 -97.342183,35.883097,0.0 -97.34223,35.883197,0.0 -97.342242,35.883258,0.0 -97.34223,35.883333,0.0 -97.34222,35.883372,0.0 -97.342217,35.883407,0.0 -97.34221,35.883465,0.0 -97.342205,35.883505,0.0 -97.342202,35.883523,0.0 -97.342202,35.883537,0.0 -97.342202,35.883522,0.0 -97.3422,35.883515,0.0 -97.342203,35.883487,0.0 -97.342208,35.883457,0.0 -97.342213,35.883423,0.0 -97.34222,35.883385,0.0 -97.342223,35.883375,0.0 -97.342213,35.883333,0.0 -97.342212,35.88332,0.0 -97.34221,35.883288,0.0 -97.342217,35.883232,0.0 -97.342225,35.883203,0.0 -97.34223,35.883175,0.0 -97.342238,35.883133,0.0 -97.342237,35.883103,0.0 -97.342213,35.883052,0.0 -97.342197,35.882983,0.0 -97.34221,35.882952,0.0 -97.342218,35.882965,0.0 -97.342178,35.882973,0.0 -97.342137,35.882952,0.0 -97.342078,35.882873,0.0 -97.342028,35.882807,0.0 -97.342005,35.882767,0.0 -97.341967,35.882705,0.0 -97.341905,35.882605,0.0 -97.341852,35.882523,0.0 -97.341767,35.882397,0.0 -97.341683,35.882273,0.0 -97.341625,35.882182,0.0 -97.34153,35.882025,0.0 -97.341428,35.881865,0.0 -97.341355,35.881765,0.0 -97.341255,35.881615,0.0 -97.34116,35.881525,0.0 -97.341103,35.881508,0.0 -97.341042,35.881527,0.0 -97.34103,35.881583,0.0 -97.341048,35.881642,0.0 -97.341057,35.881763,0.0 -97.34105,35.881887,0.0 -97.34105,35.88197,0.0 -97.341052,35.882098,0.0 -97.341035,35.882232,0.0 -97.34102,35.88232,0.0 -97.341,35.882453,0.0 -97.340967,35.882585,0.0 -97.340945,35.882678,0.0 -97.340927,35.88281,0.0 -97.340915,35.882955,0.0 -97.34091,35.883063,0.0 -97.340912,35.883217,0.0 -97.34091,35.883362,0.0 -97.340917,35.883447,0.0 -97.340973,35.88353,0.0 -97.341075,35.883537,0.0 -97.341152,35.883542,0.0 -97.341288,35.883598,0.0 -97.341432,35.883662,0.0 -97.341513,35.883703,0.0 -97.34165,35.883762,0.0 -97.341815,35.883817,0.0 -97.34193,35.883843,0.0 -97.34207,35.883882,0.0 -97.342162,35.883932,0.0 -97.3422,35.883968,0.0 -97.342237,35.884002,0.0 -97.342263,35.884022,0.0 -97.342287,35.884037,0.0 -97.342322,35.884052,0.0 -97.342375,35.884068,0.0 -97.342427,35.88407,0.0 -97.342512,35.884065,0.0 -97.342612,35.88407,0.0 -97.34265,35.884075,0.0 -97.342645,35.884067,0.0 -97.342725,35.884093,0.0 -97.34282,35.884115,0.0 -97.342983,35.88414,0.0 -97.34315,35.884175,0.0 -97.343233,35.88423,0.0 -97.343277,35.884362,0.0 -97.343202,35.884488,0.0 -97.343138,35.884567,0.0 -97.343083,35.884658,0.0 -97.342987,35.884688,0.0 -97.342915,35.884688,0.0 -97.342817,35.884688,0.0 -97.342768,35.884687,0.0 -97.342732,35.884685,0.0 -97.342598,35.88468,0.0 -97.342397,35.884675,0.0 -97.342228,35.884672,0.0 -97.341938,35.884662,0.0 -97.341632,35.884655,0.0 -97.341422,35.88465,0.0 -97.341095,35.884648,0.0 -97.340758,35.884647,0.0 -97.340522,35.884643,0.0 -97.340162,35.88464,0.0 -97.33981,35.88464,0.0 -97.339598,35.884633,0.0 -97.339268,35.88463,0.0 -97.338935,35.884628,0.0 -97.338712,35.88463,0.0 -97.338373,35.884635,0.0 -97.338043,35.88464,0.0 -97.33782,35.884642,0.0 -97.337487,35.884642,0.0 -97.33716,35.88464,0.0 -97.336942,35.884633,0.0 -97.336638,35.88463,0.0 -97.336372,35.88463,0.0 -97.336217,35.88463,0.0 -97.33602,35.884628,0.0 -97.335888,35.884633,0.0 -97.335792,35.884637,0.0 -97.335595,35.884637,0.0 -97.33535,35.88463,0.0 -97.335167,35.884625,0.0 -97.334883,35.884618,0.0 -97.33458,35.884613,0.0 -97.334372,35.884607,0.0 -97.334047,35.884605,0.0 -97.333712,35.88461,0.0 -97.333498,35.884615,0.0 -97.333193,35.884613,0.0 -97.332922,35.884613,0.0 -97.332772,35.884612,0.0 -97.332585,35.884632,0.0 -97.332488,35.884712,0.0 -97.332422,35.884768,0.0 -97.332267,35.88483,0.0 -97.332103,35.884858,0.0 -97.331992,35.884872,0.0 -97.33182,35.884918,0.0 -97.331683,35.885015,0.0 -97.33162,35.885103,0.0 -97.33157,35.885283,0.0 -97.331555,35.885478,0.0 -97.331553,35.885608,0.0 -97.331547,35.885805,0.0 -97.331542,35.885998,0.0 -97.331545,35.886133,0.0 -97.331542,35.88635,0.0 -97.331548,35.88657,0.0 -97.33155,35.886707,0.0 -97.331542,35.886863,0.0 -97.33154,35.88695,0.0 -97.33154,35.886977,0.0 -97.331537,35.886993,0.0 -97.331528,35.886958,0.0 -97.331525,35.88696,0.0 -97.331523,35.886963,0.0 -97.331525,35.886967,0.0 -97.331517,35.886967,0.0 -97.33152,35.88694,0.0 -97.331527,35.886888,0.0 -97.33153,35.886822,0.0 -97.331525,35.88677,0.0 -97.331517,35.88669,0.0 -97.331508,35.886613,0.0 -97.331507,35.886567,0.0 -97.331503,35.886497,0.0 -97.3315,35.886417,0.0 -97.331498,35.886358,0.0 -97.331492,35.886287,0.0 -97.33149,35.886237,0.0 -97.331495,35.8862,0.0 -97.3315,35.886128,0.0 -97.33151,35.886075,0.0 -97.331513,35.886052,0.0 -97.331503,35.886033,0.0 -97.331507,35.886033,0.0 -97.331533,35.88604,0.0 -97.331548,35.886037,0.0 -97.331547,35.886017,0.0 -97.331562,35.885983,0.0 -97.331553,35.885913,0.0 -97.331548,35.885802,0.0 -97.331553,35.8857,0.0 -97.331553,35.885498,0.0 -97.331557,35.88528,0.0 -97.331577,35.885137,0.0 -97.331682,35.884938,0.0 -97.331888,35.884832,0.0 -97.33205,35.88481,0.0 -97.332255,35.884783,0.0 -97.332388,35.884715,0.0 -97.332433,35.884675,0.0 -97.332458,35.884658,0.0 -97.332463,35.88466,0.0 -97.332467,35.88461,0.0 -97.332433,35.884582,0.0 -97.332348,35.884575,0.0 -97.332225,35.884582,0.0 -97.332133,35.884587,0.0 -97.332002,35.884587,0.0 -97.331838,35.884587,0.0 -97.331695,35.884585,0.0 -97.331443,35.884587,0.0 -97.33116,35.88459,0.0 -97.330955,35.884583,0.0 -97.330632,35.88458,0.0 -97.330282,35.884573,0.0 -97.330028,35.88457,0.0 -97.329648,35.884567,0.0 -97.329282,35.88456,0.0 -97.32904,35.884562,0.0 -97.32868,35.884558,0.0 -97.328323,35.884563,0.0 -97.328102,35.884567,0.0 -97.32779,35.884563,0.0 -97.327475,35.88457,0.0 -97.327248,35.884572,0.0 -97.326928,35.884575,0.0 -97.326597,35.88457,0.0 -97.326368,35.884568,0.0 -97.326023,35.88457,0.0 -97.32568,35.884565,0.0 -97.325445,35.884563,0.0 -97.325095,35.884557,0.0 -97.324758,35.884552,0.0 -97.324542,35.884555,0.0 -97.32422,35.884555,0.0 -97.323873,35.88455,0.0 -97.32363,35.884548,0.0 -97.323255,35.884548,0.0 -97.322883,35.884545,0.0 -97.322633,35.884545,0.0 -97.32227,35.88454,0.0 -97.321915,35.88454,0.0 -97.321685,35.884538,0.0 -97.321337,35.884538,0.0 -97.320973,35.884535,0.0 -97.32073,35.88454,0.0 -97.320377,35.884542,0.0 -97.320032,35.884532,0.0 -97.319815,35.884532,0.0 -97.319493,35.884532,0.0 -97.319165,35.884527,0.0 -97.318947,35.884525,0.0 -97.318628,35.884523,0.0 -97.31836,35.884523,0.0 -97.318227,35.884527,0.0 -97.318125,35.884572,0.0 -97.318112,35.884682,0.0 -97.318115,35.884783,0.0 -97.318108,35.884978,0.0 -97.318107,35.885207,0.0 -97.31811,35.885372,0.0 -97.318125,35.88563,0.0 -97.318132,35.885887,0.0 -97.31813,35.886047,0.0 -97.318128,35.886287,0.0 -97.318137,35.886533,0.0 -97.318143,35.886698,0.0 -97.318153,35.886958,0.0 -97.318162,35.887213,0.0 -97.318168,35.887375,0.0 -97.318167,35.887618,0.0 -97.318172,35.88787,0.0 -97.318178,35.888042,0.0 -97.31818,35.888322,0.0 -97.318187,35.888637,0.0 -97.318192,35.888845,0.0 -97.318205,35.889137,0.0 -97.31821,35.889422,0.0 -97.318218,35.889608,0.0 -97.318217,35.88988,0.0 -97.318218,35.890155,0.0 -97.318217,35.890347,0.0 -97.318223,35.890647,0.0 -97.318233,35.89096,0.0 -97.318238,35.891167,0.0 -97.318248,35.891482,0.0 -97.318255,35.89179,0.0 -97.318267,35.891988,0.0 -97.318275,35.892277,0.0 -97.31828,35.89256,0.0 -97.318285,35.892742,0.0 -97.318292,35.893005,0.0 -97.318293,35.89324,0.0 -97.318297,35.893363,0.0 -97.31831,35.893518,0.0 -97.318293,35.89361,0.0 -97.31827,35.893635,0.0 -97.318237,35.893647,0.0 -97.318218,35.893647,0.0 -97.318218,35.893647,0.0 -97.31829,35.893608,0.0 -97.318305,35.893605,0.0 -97.318333,35.893588,0.0 -97.318342,35.893587,0.0 -97.31834,35.893607,0.0 -97.318337,35.893628,0.0 -97.31834,35.893608,0.0 -97.31833,35.893565,0.0 -97.31833,35.8935,0.0 -97.318335,35.893432,0.0 -97.31833,35.893385,0.0 -97.318327,35.893313,0.0 -97.318325,35.893245,0.0 -97.318323,35.893205,0.0 -97.31832,35.893158,0.0 -97.318308,35.893118,0.0 -97.318303,35.893088,0.0 -97.3183,35.893047,0.0 -97.318293,35.893013,0.0 -97.318297,35.892997,0.0 -97.318293,35.892977,0.0 -97.318283,35.892963,0.0 -97.318358,35.892985,0.0 -97.318362,35.89308,0.0 -97.318358,35.893203,0.0 -97.318393,35.893245,0.0 -97.318435,35.893252,0.0 -97.318415,35.893253,0.0 -97.318407,35.893252,0.0 -97.318363,35.893262,0.0 -97.318353,35.893267,0.0 -97.318343,35.893248,0.0 -97.318323,35.893172,0.0 -97.31831,35.893017,0.0 -97.318303,35.892885,0.0 -97.318295,35.892665,0.0 -97.318285,35.892415,0.0 -97.31828,35.892238,0.0 -97.318272,35.891967,0.0 -97.318257,35.891678,0.0 -97.318252,35.891472,0.0 -97.318247,35.891155,0.0 -97.31824,35.890847,0.0 -97.318228,35.890647,0.0 -97.318223,35.89035,0.0 -97.318213,35.890065,0.0 -97.318207,35.889873,0.0 -97.318198,35.889583,0.0 -97.318188,35.88927,0.0 -97.31818,35.889053,0.0 -97.318165,35.888728,0.0 -97.318157,35.888407,0.0 -97.318152,35.8882,0.0 -97.318143,35.887893,0.0 -97.318143,35.887582,0.0 -97.318143,35.887368,0.0 -97.318142,35.887038,0.0 -97.318138,35.886698,0.0 -97.318132,35.886473,0.0 -97.318128,35.886133,0.0 -97.318133,35.885787,0.0 -97.318128,35.885558,0.0 -97.31812,35.885252,0.0 -97.318105,35.884978,0.0 -97.3181,35.884817,0.0 -97.318088,35.884635,0.0 -97.318052,35.88455,0.0 -97.317985,35.884522,0.0 -97.317852,35.884517,0.0 -97.317637,35.88452,0.0 -97.317422,35.884515,0.0 -97.317052,35.884523,0.0 -97.316652,35.884535,0.0 -97.316367,35.884535,0.0 -97.315968,35.884542,0.0 -97.315588,35.884542,0.0 -97.315318,35.884543,0.0 -97.314882,35.884542,0.0 -97.314423,35.884545,0.0 -97.314123,35.884542,0.0 -97.313673,35.884538,0.0 -97.313202,35.884532,0.0 -97.312892,35.884535,0.0 -97.312452,35.884547,0.0 -97.312028,35.884552,0.0 -97.311743,35.884558,0.0 -97.311342,35.884567,0.0 -97.310955,35.884568,0.0 -97.310693,35.884563,0.0 -97.310272,35.884562,0.0 -97.309835,35.884568,0.0 -97.309543,35.884573,0.0 -97.309127,35.88458,0.0 -97.308705,35.88458,0.0 -97.308425,35.884577,0.0 -97.307983,35.884572,0.0 -97.307543,35.884573,0.0 -97.307248,35.884577,0.0 -97.306802,35.88457,0.0 -97.306352,35.884572,0.0 -97.306057,35.884573,0.0 -97.305605,35.88458,0.0 -97.305155,35.884585,0.0 -97.304857,35.88459,0.0 -97.304433,35.884595,0.0 -97.304043,35.884598,0.0 -97.303782,35.884603,0.0 -97.303377,35.884612,0.0 -97.302972,35.884617,0.0 -97.302702,35.88462,0.0 -97.302305,35.884625,0.0 -97.301903,35.884625,0.0 -97.301653,35.884625,0.0 -97.30129,35.884627,0.0 -97.30094,35.884618,0.0 -97.300748,35.884613,0.0 -97.30053,35.884615,0.0 -97.300415,35.884642,0.0 -97.300392,35.884703,0.0 -97.300402,35.884862,0.0 -97.300402,35.88511,0.0 -97.300395,35.885317,0.0 -97.300398,35.885657,0.0 -97.300402,35.886,0.0 -97.30041,35.88623,0.0 -97.30041,35.886555,0.0 -97.300412,35.88689,0.0 -97.300413,35.88711,0.0 -97.300417,35.887447,0.0 -97.300422,35.887802,0.0 -97.300423,35.888058,0.0 -97.300435,35.888467,0.0 -97.300442,35.888888,0.0 -97.300453,35.889173,0.0 -97.300468,35.889605,0.0 -97.30047,35.890015,0.0 -97.300468,35.890287,0.0 -97.300473,35.890692,0.0 -97.300485,35.891078,0.0 -97.300487,35.891342,0.0 -97.300492,35.891747,0.0 -97.30049,35.892165,0.0 -97.300493,35.89245,0.0 -97.300495,35.892872,0.0 -97.3005,35.893297,0.0 -97.300505,35.893588,0.0 -97.300512,35.894022,0.0 -97.300523,35.894447,0.0 -97.300527,35.894718,0.0 -97.300528,35.89512,0.0 -97.300525,35.895518,0.0 -97.300525,35.89578,0.0 -97.300532,35.896165,0.0 -97.300535,35.896543,0.0 -97.300538,35.896797,0.0 -97.300545,35.897178,0.0 -97.300553,35.897557,0.0 -97.30056,35.8978,0.0 -97.300568,35.898152,0.0 -97.300567,35.898493,0.0 -97.300568,35.898717,0.0 -97.300573,35.899038,0.0 -97.30058,35.899345,0.0 -97.30058,35.899527,0.0 -97.30058,35.899772,0.0 -97.30058,35.900007,0.0 -97.300577,35.900155,0.0 -97.300575,35.900383,0.0 -97.300578,35.9006,0.0 -97.300578,35.900758,0.0 -97.300583,35.901003,0.0 -97.300577,35.90125,0.0 -97.300575,35.901425,0.0 -97.300565,35.901687,0.0 -97.300563,35.901963,0.0 -97.300558,35.902142,0.0 -97.30055,35.90241,0.0 -97.300545,35.902662,0.0 -97.300542,35.902817,0.0 -97.300535,35.903055,0.0 -97.300537,35.903292,0.0 -97.300532,35.903458,0.0 -97.300517,35.903728,0.0 -97.300513,35.904042,0.0 -97.300512,35.904262,0.0 -97.300513,35.904592,0.0 -97.30051,35.90494,0.0 -97.300508,35.905173,0.0 -97.300498,35.90554,0.0 -97.300493,35.90589,0.0 -97.300492,35.90612,0.0 -97.300485,35.906478,0.0 -97.300487,35.906837,0.0 -97.300492,35.907077,0.0 -97.300495,35.907437,0.0 -97.3005,35.907798,0.0 -97.300502,35.908038,0.0 -97.300505,35.9084,0.0 -97.300508,35.908765,0.0 -97.300508,35.909007,0.0 -97.300512,35.909372,0.0 -97.300515,35.909732,0.0 -97.300518,35.909965,0.0 -97.300518,35.910322,0.0 -97.300517,35.910672,0.0 -97.300513,35.91088,0.0 -97.300508,35.911127,0.0 -97.300508,35.911268,0.0 -97.30051,35.911323,0.0 -97.300512,35.911373,0.0 -97.300513,35.91143,0.0 -97.300515,35.911483,0.0 -97.300517,35.911547,0.0 -97.300515,35.91157,0.0 -97.30051,35.911572,0.0 -97.30047,35.911523,0.0 -97.300473,35.91151,0.0 -97.300475,35.911502,0.0 -97.300475,35.911502,0.0 -97.300502,35.911505,0.0 -97.300547,35.911543,0.0 -97.300573,35.911552,0.0 -97.30058,35.911552,0.0 -97.300548,35.911555,0.0 -97.300525,35.911555,0.0 -97.300505,35.91157,0.0 -97.300498,35.91159,0.0 -97.300495,35.91153,0.0 -97.300497,35.911447,0.0 -97.300507,35.911258,0.0 -97.300508,35.910998,0.0 -97.300513,35.910807,0.0 -97.300517,35.910512,0.0 -97.30052,35.910212,0.0 -97.300525,35.910005,0.0 -97.300517,35.909687,0.0 -97.300507,35.909365,0.0 -97.300503,35.90916,0.0 -97.300497,35.908862,0.0 -97.300492,35.908552,0.0 -97.300492,35.908345,0.0 -97.300495,35.908025,0.0 -97.300495,35.907697,0.0 -97.3005,35.907475,0.0 -97.300503,35.907117,0.0 -97.300513,35.906758,0.0 -97.300517,35.906512,0.0 -97.300525,35.906138,0.0 -97.30052,35.90577,0.0 -97.300515,35.90553,0.0 -97.300523,35.905182,0.0 -97.300527,35.904847,0.0 -97.30053,35.90463,0.0 -97.300532,35.90431,0.0 -97.30053,35.903988,0.0 -97.30053,35.903772,0.0 -97.300533,35.903445,0.0 -97.300538,35.903142,0.0 -97.30054,35.90296,0.0 -97.300535,35.902698,0.0 -97.300542,35.902437,0.0 -97.300543,35.902243,0.0 -97.300547,35.90194,0.0 -97.300543,35.901653,0.0 -97.300538,35.901492,0.0 -97.300535,35.901282,0.0 -97.300543,35.901115,0.0 -97.300542,35.90104,0.0 -97.300538,35.900988,0.0 -97.300542,35.90098,0.0 -97.30054,35.90098,0.0 -97.300578,35.900942,0.0 -97.30058,35.900937,0.0 -97.300573,35.900897,0.0 -97.300565,35.900855,0.0 -97.300567,35.900833,0.0 -97.300582,35.900835,0.0 -97.300583,35.90076,0.0 -97.30059,35.90061,0.0 -97.300593,35.900485,0.0 -97.300598,35.900263,0.0 -97.300605,35.900023,0.0 -97.300603,35.899868,0.0 -97.30061,35.899625,0.0 -97.300615,35.89937,0.0 -97.300615,35.899197,0.0 -97.300612,35.898933,0.0 -97.3006,35.898652,0.0 -97.300593,35.898462,0.0 -97.300587,35.898175,0.0 -97.30058,35.897878,0.0 -97.300577,35.897655,0.0 -97.300573,35.897308,0.0 -97.300573,35.896943,0.0 -97.300575,35.896697,0.0 -97.300572,35.896337,0.0 -97.300565,35.895972,0.0 -97.300558,35.895718,0.0 -97.30055,35.895335,0.0 -97.300548,35.894967,0.0 -97.30054,35.894732,0.0 -97.300533,35.894368,0.0 -97.300525,35.893988,0.0 -97.30052,35.893735,0.0 -97.300517,35.893348,0.0 -97.30051,35.892965,0.0 -97.300505,35.89271,0.0 -97.300505,35.892322,0.0 -97.300505,35.891947,0.0 -97.300502,35.89169,0.0 -97.300502,35.891312,0.0 -97.300498,35.89095,0.0 -97.300493,35.890712,0.0 -97.30049,35.890337,0.0 -97.30049,35.889952,0.0 -97.300487,35.889702,0.0 -97.300477,35.889338,0.0 -97.300473,35.888973,0.0 -97.300473,35.888732,0.0 -97.300468,35.888372,0.0 -97.300465,35.888008,0.0 -97.300462,35.887767,0.0 -97.300458,35.887398,0.0 -97.30045,35.887043,0.0 -97.300442,35.886807,0.0 -97.300433,35.886442,0.0 -97.300423,35.88607,0.0 -97.300415,35.885828,0.0 -97.300412,35.885482,0.0 -97.300407,35.885162,0.0 -97.300413,35.884968,0.0 -97.300418,35.884748,0.0 -97.30041,35.884617,0.0 -97.300403,35.884588,0.0 -97.300342,35.884548,0.0 -97.300152,35.884538,0.0 -97.299957,35.884547,0.0 -97.29963,35.884553,0.0 -97.299277,35.884555,0.0 -97.299023,35.884552,0.0 -97.298613,35.884547,0.0 -97.298187,35.884543,0.0 -97.297915,35.88454,0.0 -97.297507,35.884538,0.0 -97.297127,35.884538,0.0 -97.296883,35.884537,0.0 -97.296515,35.884532,0.0 -97.296118,35.88452,0.0 -97.295857,35.884512,0.0 -97.295482,35.884502,0.0 -97.295158,35.884492,0.0 -97.29496,35.884485,0.0 -97.294648,35.88448,0.0 -97.294247,35.884475,0.0 -97.293957,35.884472,0.0 -97.293498,35.884468,0.0 -97.29302,35.884462,0.0 -97.292708,35.884457,0.0 -97.292228,35.884448,0.0 -97.291712,35.884442,0.0 -97.291358,35.88444,0.0 -97.290822,35.884435,0.0 -97.290253,35.884425,0.0 -97.289868,35.88442,0.0 -97.28932,35.88441,0.0 -97.288803,35.884402,0.0 -97.28848,35.884393,0.0 -97.288038,35.884388,0.0 -97.287585,35.884373,0.0 -97.287273,35.884365,0.0 -97.286808,35.884363,0.0 -97.28632,35.884355,0.0 -97.28599,35.884348,0.0 -97.285488,35.88434,0.0 -97.28499,35.884335,0.0 -97.284655,35.884332,0.0 -97.284175,35.884327,0.0 -97.283767,35.884325,0.0 -97.283527,35.884323,0.0 -97.283205,35.884327,0.0 -97.282937,35.884323,0.0 -97.282795,35.88432,0.0 -97.282667,35.884357,0.0 -97.282645,35.88446,0.0 -97.282633,35.884548,0.0 -97.28262,35.884737,0.0 -97.282607,35.884992,0.0 -97.282625,35.885163,0.0 -97.282653,35.88543,0.0 -97.28267,35.885712,0.0 -97.282677,35.885907,0.0 -97.282685,35.886188,0.0 -97.282687,35.886452,0.0 -97.282692,35.886632,0.0 -97.282692,35.886897,0.0 -97.282693,35.887187,0.0 -97.282695,35.887395,0.0 -97.282703,35.887718,0.0 -97.282708,35.888047,0.0 -97.282708,35.88827,0.0 -97.282707,35.888623,0.0 -97.282708,35.888995,0.0 -97.282708,35.889235,0.0 -97.282715,35.889565,0.0 -97.282723,35.889905,0.0 -97.282723,35.890122,0.0 -97.282727,35.890448,0.0 -97.282732,35.890788,0.0 -97.282728,35.89103,0.0 -97.282722,35.8914,0.0 -97.28271,35.891763,0.0 -97.2827,35.892007,0.0 -97.282697,35.89238,0.0 -97.282703,35.892767,0.0 -97.282708,35.893015,0.0 -97.282712,35.893372,0.0 -97.282713,35.89372,0.0 -97.28272,35.893945,0.0 -97.282735,35.894263,0.0 -97.282742,35.89456,0.0 -97.28275,35.894773,0.0 -97.282757,35.8951,0.0 -97.28276,35.895422,0.0 -97.282755,35.895645,0.0 -97.282755,35.896008,0.0 -97.282753,35.896387,0.0 -97.28275,35.896643,0.0 -97.282747,35.897023,0.0 -97.282747,35.897372,0.0 -97.282753,35.8976,0.0 -97.282768,35.897935,0.0 -97.282772,35.898253,0.0 -97.282778,35.898462,0.0 -97.28277,35.898775,0.0 -97.282762,35.899088,0.0 -97.28276,35.899287,0.0 -97.282758,35.899567,0.0 -97.282747,35.899818,0.0 -97.28274,35.899962,0.0 -97.282745,35.900117,0.0 -97.282813,35.9002,0.0 -97.282898,35.900208,0.0 -97.28304,35.9002,0.0 -97.283187,35.900198,0.0 -97.283282,35.900197,0.0 -97.283413,35.900195,0.0 -97.283547,35.900198,0.0 -97.283627,35.9002,0.0 -97.28372,35.9002,0.0 -97.283782,35.900198,0.0 -97.28381,35.900197,0.0 -97.283857,35.900197,0.0 -97.283915,35.900195,0.0 -97.283967,35.900193,0.0 -97.284037,35.900202,0.0 -97.284072,35.900233,0.0 -97.284077,35.900257,0.0 -97.28407,35.90027,0.0 -97.284068,35.900272,0.0 -97.28405,35.900242,0.0 -97.28403,35.900208,0.0 -97.284015,35.900195,0.0 -97.28398,35.900177,0.0 -97.283973,35.900178,0.0 -97.28398,35.900177,0.0 -97.284028,35.900157,0.0 -97.284075,35.900112,0.0 -97.284112,35.900085,0.0 -97.284178,35.900063,0.0 -97.284263,35.90005,0.0 -97.284322,35.900048,0.0 -97.284408,35.900037,0.0 -97.28449,35.900028,0.0 -97.284555,35.900037,0.0 -97.284635,35.900063,0.0 -97.284687,35.90009,0.0 -97.28472,35.900113,0.0 -97.284768,35.900147,0.0 -97.284787,35.90016,0.0 -97.28479,35.90016,0.0 -97.284825,35.900187,0.0 -97.284858,35.900217,0.0 -97.28487,35.900228,0.0 -97.284895,35.900252,0.0 -97.284913,35.900268,0.0 -97.28493,35.900287,0.0 -97.284965,35.900312,0.0 -97.284993,35.900307,0.0 -97.284988,35.90031,0.0 -97.285007,35.900313,0.0 -97.28503,35.900297,0.0 -97.285068,35.900255,0.0 -97.285132,35.900208,0.0 -97.285177,35.900175,0.0 -97.28525,35.900117,0.0 -97.285338,35.90005,0.0 -97.285397,35.900008,0.0 -97.285493,35.899935,0.0 -97.28559,35.899862,0.0 -97.285657,35.899812,0.0 -97.285752,35.89973,0.0 -97.285867,35.899637,0.0 -97.285952,35.899572,0.0 -97.286082,35.899473,0.0 -97.28621,35.899375,0.0 -97.286297,35.899317,0.0 -97.286445,35.899213,0.0 -97.286617,35.899113,0.0 -97.286735,35.899055,0.0 -97.286892,35.898975,0.0 -97.28704,35.89892,0.0 -97.287143,35.898908,0.0 -97.28725,35.898905,0.0 -97.2873,35.898908,0.0 -97.287315,35.89891,0.0 -97.28734,35.898912,0.0 -97.287378,35.898922,0.0 -97.287475,35.898962,0.0 -97.28758,35.898983,0.0 -97.287632,35.898993,0.0 -97.287673,35.899038,0.0 -97.287675,35.899107,0.0 -97.287682,35.899168,0.0 -97.287723,35.89926,0.0 -97.287738,35.899353,0.0 -97.287707,35.899427,0.0 -97.287675,35.899533,0.0 -97.287695,35.899638,0.0 -97.287723,35.899717,0.0 -97.28777,35.899838,0.0 -97.287823,35.899963,0.0 -97.28786,35.900052,0.0 -97.287917,35.90017,0.0 -97.287963,35.900265,0.0 -97.287993,35.90033,0.0 -97.288057,35.900437,0.0 -97.288147,35.900545,0.0 -97.28821,35.900615,0.0 -97.288317,35.90073,0.0 -97.288423,35.90085,0.0 -97.288495,35.900925,0.0 -97.288607,35.901037,0.0 -97.288722,35.90115,0.0 -97.288798,35.901225,0.0 -97.288922,35.901338,0.0 -97.289048,35.901452,0.0 -97.289128,35.901527,0.0 -97.289242,35.901657,0.0 -97.289357,35.901812,0.0 -97.289428,35.901922,0.0 -97.28952,35.902058,0.0 -97.289592,35.902153,0.0 -97.289618,35.902193,0.0 -97.289633,35.902212,0.0 -97.289632,35.902208,0.0 -97.289645,35.902212,0.0 -97.289672,35.90227,0.0 -97.289677,35.902333,0.0 -97.28968,35.902377,0.0 -97.289692,35.902398,0.0 -97.289693,35.902403,0.0 -97.289682,35.90246,0.0 -97.289677,35.902547,0.0 -97.289672,35.902707,0.0 -97.289667,35.90287,0.0 -97.289668,35.902968,0.0 -97.289672,35.903123,0.0 -97.28967,35.90329,0.0 -97.289663,35.903393,0.0 -97.289648,35.903545,0.0 -97.289633,35.9037,0.0 -97.289618,35.903802,0.0 -97.2896,35.903938,0.0 -97.289598,35.904067,0.0 -97.28961,35.90415,0.0 -97.289675,35.904262,0.0 -97.289753,35.904362,0.0 -97.28981,35.904433,0.0 -97.289898,35.904542,0.0 -97.289997,35.904653,0.0 -97.290067,35.904727,0.0 -97.290178,35.90484,0.0 -97.290298,35.90494,0.0 -97.290383,35.905003,0.0 -97.290515,35.905093,0.0 -97.290635,35.905182,0.0 -97.29071,35.905242,0.0 -97.290798,35.905337,0.0 -97.290813,35.905447,0.0 -97.290813,35.905523,0.0 -97.290763,35.905638,0.0 -97.290638,35.905702,0.0 -97.290543,35.905708,0.0 -97.290413,35.905712,0.0 -97.290347,35.905715,0.0 -97.29035,35.905713,0.0 -97.29027,35.905693,0.0 -97.290242,35.905658,0.0 -97.29024,35.905648,0.0 -97.290235,35.90565,0.0 -97.29024,35.905683,0.0 -97.29024,35.905683,0.0 -97.290297,35.905668,0.0 -97.290395,35.905673,0.0 -97.290477,35.905683,0.0 -97.29061,35.905688,0.0 -97.290723,35.90564,0.0 -97.290765,35.905585,0.0 -97.290787,35.905512,0.0 -97.290787,35.905465,0.0 -97.290788,35.905453,0.0 -97.29079,35.905413,0.0 -97.290793,35.905328,0.0 -97.290797,35.905243,0.0 -97.290815,35.905088,0.0 -97.29084,35.904902,0.0 -97.290868,35.904782,0.0 -97.290917,35.90459,0.0 -97.290953,35.904387,0.0 -97.29098,35.90425,0.0 -97.29102,35.904042,0.0 -97.29108,35.903842,0.0 -97.29112,35.903713,0.0 -97.291137,35.903527,0.0 -97.291107,35.903348,0.0 -97.29107,35.903225,0.0 -97.291013,35.903035,0.0 -97.290965,35.90286,0.0 -97.290935,35.902747,0.0 -97.290893,35.902588,0.0 -97.290867,35.902465,0.0 -97.290845,35.902395,0.0 -97.290742,35.902352,0.0 -97.290598,35.90235,0.0 -97.290498,35.902352,0.0 -97.290347,35.902352,0.0 -97.290212,35.902355,0.0 -97.290152,35.90236,0.0 -97.290092,35.902363,0.0 -97.290068,35.902368,0.0 -97.290068,35.902372,0.0 -97.290058,35.902375,0.0 -97.289963,35.902375,0.0 -97.2899,35.902385,0.0 -97.289837,35.902395,0.0 -97.28981,35.902397,0.0 -97.289778,35.902393000000004,0.0 -97.289715,35.90238,0.0 -97.289687,35.902345,0.0 -97.289682,35.902328,0.0 -97.289682,35.902283,0.0 -97.289678,35.902238,0.0 -97.28968,35.902228,0.0 -97.289688,35.902185,0.0 -97.289683,35.90216,0.0 -97.289678,35.902077,0.0 -97.289672,35.90194,0.0 -97.28966,35.901828,0.0 -97.289637,35.901652,0.0 -97.289605,35.901462,0.0 -97.28958,35.901328,0.0 -97.28954,35.901128,0.0 -97.2895,35.900938,0.0 -97.289467,35.900815,0.0 -97.289413,35.900637,0.0 -97.289362,35.900463,0.0 -97.289325,35.90035,0.0 -97.289275,35.900173,0.0 -97.289223,35.899992,0.0 -97.289183,35.89987,0.0 -97.289103,35.899693,0.0 -97.288977,35.899557,0.0 -97.288882,35.899482,0.0 -97.288723,35.899393,0.0 -97.288537,35.899313,0.0 -97.288393,35.899257,0.0 -97.288162,35.899178,0.0 -97.287955,35.899117,0.0 -97.28785,35.899083,0.0 -97.287753,35.89906,0.0 -97.287733,35.899058,0.0 -97.287732,35.899058,0.0 -97.287683,35.899037,0.0 -97.287602,35.899008,0.0 -97.287538,35.898997,0.0 -97.287472,35.898998,0.0 -97.287477,35.899005,0.0 -97.287398,35.898992,0.0 -97.287283,35.89896,0.0 -97.287183,35.898962,0.0 -97.287002,35.899007,0.0 -97.286798,35.899052,0.0 -97.286672,35.89909,0.0 -97.286505,35.89917,0.0 -97.286347,35.899267,0.0 -97.286243,35.899337,0.0 -97.286082,35.899452,0.0 -97.285927,35.899563,0.0 -97.285828,35.89964,0.0 -97.285682,35.899763,0.0 -97.28553,35.899887,0.0 -97.285422,35.89997,0.0 -97.285275,35.900093,0.0 -97.285153,35.900202,0.0 -97.285102,35.90027,0.0 -97.285035,35.90034,0.0 -97.285018,35.900342,0.0 -97.284978,35.900343,0.0 -97.284937,35.90034,0.0 -97.284888,35.900323,0.0 -97.284867,35.900303,0.0 -97.284833,35.900263,0.0 -97.284822,35.900247,0.0 -97.284782,35.900193,0.0 -97.284695,35.90012,0.0 -97.28461,35.900065,0.0 -97.284537,35.900047,0.0 -97.284422,35.900053,0.0 -97.284298,35.900062,0.0 -97.284212,35.90008,0.0 -97.2841,35.900137,0.0 -97.284,35.900192,0.0 -97.283927,35.90021,0.0 -97.28381,35.900203,0.0 -97.283667,35.900198,0.0 -97.283555,35.900197,0.0 -97.28338,35.900197,0.0 -97.283227,35.900192,0.0 -97.283145,35.900192,0.0 -97.283043,35.900193,0.0 -97.28293,35.900193,0.0 -97.28286,35.900195,0.0 -97.282813,35.900197,0.0 -97.282802,35.900198,0.0 -97.282782,35.900128,0.0 -97.282778,35.900027,0.0 -97.282777,35.899833,0.0 -97.282778,35.899658,0.0 -97.282778,35.89937,0.0 -97.282775,35.899092,0.0 -97.28278,35.898922,0.0 -97.282782,35.898707,0.0 -97.282753,35.898575,0.0 -97.282683,35.898528,0.0 -97.282497,35.898522,0.0 -97.282205,35.898525,0.0 -97.28198,35.898527,0.0 -97.281647,35.898525,0.0 -97.281358,35.898525,0.0 -97.281168,35.898525,0.0 -97.280808,35.898522,0.0 -97.280417,35.89852,0.0 -97.280183,35.89852,0.0 -97.279852,35.898518,0.0 -97.279482,35.898523,0.0 -97.279243,35.898523,0.0 -97.278907,35.89853,0.0 -97.278582,35.898533,0.0 -97.278377,35.898533,0.0 -97.278052,35.898537,0.0 -97.27771,35.898528,0.0 -97.277473,35.898522,0.0 -97.277125,35.898518,0.0 -97.276787,35.898522,0.0 -97.276583,35.89853,0.0 -97.276347,35.898533,0.0 -97.276102,35.898532,0.0 -97.27592,35.898532,0.0 -97.275642,35.898533,0.0 -97.275365,35.898548,0.0 -97.275197,35.898558,0.0 -97.274977,35.898563,0.0 -97.274797,35.898562,0.0 -97.274712,35.89856,0.0 -97.274643,35.898558,0.0 -97.274637,35.89856,0.0 -97.27458,35.898558,0.0 -97.274497,35.89856,0.0 -97.27434,35.898567,0.0 -97.274192,35.898572,0.0 -97.274108,35.898578,0.0 -97.27404,35.898623,0.0 -97.274038,35.898698,0.0 -97.274033,35.89875,0.0 -97.274025,35.898822,0.0 -97.27402,35.898897,0.0 -97.274022,35.898938,0.0 -97.274042,35.899017,0.0 -97.27405,35.8991,0.0 -97.274045,35.899155,0.0 -97.274035,35.899252,0.0 -97.274003,35.899372,0.0 -97.273985,35.89946,0.0 -97.273965,35.899578,0.0 -97.273957,35.899692,0.0 -97.273957,35.899768,0.0 -97.273957,35.899863,0.0 -97.273958,35.89991,0.0 -97.27396,35.899923,0.0 -97.273958,35.89993,0.0 -97.27397,35.899932,0.0 -97.273972,35.899972,0.0 -97.273987,35.90006,0.0 -97.273997,35.900158,0.0 -97.273993,35.900223,0.0 -97.273992,35.900327,0.0 -97.27399,35.900432,0.0 -97.273985,35.900513,0.0 -97.273985,35.900643,0.0 -97.273988,35.900782,0.0 -97.27399,35.90088,0.0 -97.27399,35.90103,0.0 -97.274003,35.90119,0.0 -97.27402,35.901292,0.0 -97.274052,35.901433,0.0 -97.274105,35.901572,0.0 -97.27415,35.901663,0.0 -97.274223,35.901793,0.0 -97.274288,35.901925,0.0 -97.274332,35.902015,0.0 -97.274395,35.902142,0.0 -97.274452,35.902273,0.0 -97.274482,35.902365,0.0 -97.274518,35.902497,0.0 -97.274528,35.902618,0.0 -97.274523,35.902698,0.0 -97.274518,35.902805,0.0 -97.274522,35.902918,0.0 -97.274547,35.902992,0.0 -97.274592,35.903077,0.0 -97.274657,35.90315,0.0 -97.2747,35.903212,0.0 -97.274773,35.903298,0.0 -97.27484,35.903398,0.0 -97.274887,35.903475,0.0 -97.27495,35.9036,0.0 -97.275005,35.903712,0.0 -97.27504,35.903778,0.0 -97.275085,35.903878,0.0 -97.275113,35.903945,0.0 -97.275117,35.903953,0.0 -97.275128,35.903948,0.0 -97.27515,35.903967,0.0 -97.275167,35.903992,0.0 -97.275168,35.903988,0.0 -97.275138,35.903978,0.0 -97.275135,35.903978,0.0 -97.27518,35.903983,0.0 -97.27521,35.903975,0.0 -97.27523,35.903968,0.0 -97.275235,35.903968,0.0 -97.27514,35.90406,0.0 -97.275115,35.904098,0.0 -97.275112,35.904102,0.0 -97.275125,35.904087,0.0 -97.275145,35.904062,0.0 -97.275163,35.904047,0.0 -97.275172,35.904045,0.0 -97.275182,35.904033,0.0 -97.275222,35.904025,0.0 -97.275237,35.904022,0.0 -97.275348,35.904032,0.0 -97.275263,35.904018,0.0 -97.275213,35.903982,0.0 -97.275197,35.903962,0.0 -97.27517,35.903917,0.0 -97.275137,35.90386,0.0 -97.27511,35.903817,0.0 -97.275075,35.903743,0.0 -97.275035,35.903667,0.0 -97.275003,35.903607,0.0 -97.274947,35.90351,0.0 -97.27489,35.903413,0.0 -97.274852,35.903353,0.0 -97.274755,35.903263,0.0 -97.274667,35.903173,0.0 -97.274605,35.903105,0.0 -97.274537,35.902988,0.0 -97.274505,35.902842,0.0 -97.274502,35.902743,0.0 -97.274498,35.902597,0.0 -97.274472,35.902462,0.0 -97.274448,35.902373,0.0 -97.274407,35.902247,0.0 -97.274362,35.90213,0.0 -97.274333,35.902058,0.0 -97.27429,35.901958,0.0 -97.274227,35.901818,0.0 -97.27417,35.901713,0.0 -97.274083,35.901572,0.0 -97.274017,35.90143,0.0 -97.273988,35.901323,0.0 -97.273953,35.901155,0.0 -97.273923,35.900983,0.0 -97.273912,35.900878,0.0 -97.273902,35.900715,0.0 -97.273892,35.900555,0.0 -97.273888,35.900452,0.0 -97.27389,35.90031,0.0 -97.273903,35.9002,0.0 -97.273905,35.900153,0.0 -97.273907,35.90012,0.0 -97.273903,35.90012,0.0 -97.273905,35.90007,0.0 -97.273902,35.900002,0.0 -97.273905,35.899952,0.0 -97.273908,35.89989,0.0 -97.27391,35.899848,0.0 -97.273912,35.899837,0.0 -97.273913,35.899783,0.0 -97.273915,35.89976,0.0 -97.273917,35.8997,0.0 -97.273923,35.89961,0.0 -97.273933,35.899543,0.0 -97.273947,35.899447,0.0 -97.273962,35.899343,0.0 -97.27397,35.899273,0.0 -97.27398,35.899157,0.0 -97.273975,35.899035,0.0 -97.273972,35.898947,0.0 -97.273968,35.898833,0.0 -97.273978,35.89873,0.0 -97.273982,35.898685,0.0 -97.273982,35.89866,0.0 -97.273982,35.898662,0.0 -97.27397,35.898647,0.0 -97.27389,35.89862,0.0 -97.273725,35.898618,0.0 -97.273573,35.898618,0.0 -97.273313,35.898623,0.0 -97.273032,35.898625,0.0 -97.272823,35.898623,0.0 -97.272488,35.898622,0.0 -97.272167,35.898617,0.0 -97.27197,35.89862,0.0 -97.27166,35.898618,0.0 -97.271328,35.898613,0.0 -97.271098,35.898613,0.0 -97.270727,35.898603,0.0 -97.270313,35.898592,0.0 -97.27003,35.898583,0.0 -97.269608,35.89858,0.0 -97.269218,35.898573,0.0 -97.26896,35.89857,0.0 -97.2686,35.898577,0.0 -97.268258,35.898575,0.0 -97.268035,35.898577,0.0 -97.267703,35.898577,0.0 -97.267388,35.898595,0.0 -97.267177,35.8986,0.0 -97.266852,35.898602,0.0 -97.266532,35.8986,0.0 -97.26631,35.898597,0.0 -97.265962,35.898597,0.0 -97.2656,35.898595,0.0 -97.265363,35.898597,0.0 -97.265002,35.898598,0.0 -97.264647,35.898598,0.0 -97.264418,35.898598,0.0 -97.264098,35.898598,0.0 -97.263783,35.898595,0.0 -97.263572,35.898597,0.0 -97.263242,35.89859,0.0 -97.262897,35.89859,0.0 -97.262665,35.89859,0.0 -97.2623,35.89859,0.0 -97.261923,35.898593,0.0 -97.261683,35.898592,0.0 -97.261345,35.898592,0.0 -97.261012,35.898595,0.0 -97.260768,35.898597,0.0 -97.260392,35.8986,0.0 -97.26002,35.898603,0.0 -97.259773,35.898603,0.0 -97.259407,35.898605,0.0 -97.259023,35.898603,0.0 -97.258752,35.898602,0.0 -97.25832,35.8986,0.0 -97.257888,35.898603,0.0 -97.2576,35.898603,0.0 -97.257177,35.898608,0.0 -97.25676,35.898613,0.0 -97.256492,35.898615,0.0 -97.25609,35.898613,0.0 -97.255692,35.898615,0.0 -97.25543,35.898622,0.0 -97.255022,35.89862,0.0 -97.254603,35.898617,0.0 -97.254295,35.898613,0.0 -97.253805,35.898607,0.0 -97.253325,35.898605,0.0 -97.253007,35.898602,0.0 -97.252543,35.898602,0.0 -97.252105,35.898597,0.0 -97.25183,35.898597,0.0 -97.251423,35.898602,0.0 -97.25103,35.898605,0.0 -97.250778,35.898607,0.0 -97.250397,35.8986,0.0 -97.25002,35.898605,0.0 -97.249747,35.898608,0.0 -97.24931,35.898618,0.0 -97.248867,35.89862,0.0 -97.24857,35.898627,0.0 -97.248153,35.89864,0.0 -97.247795,35.89863,0.0 -97.247587,35.898628,0.0 -97.247367,35.89862,0.0 -97.247272,35.898645,0.0 -97.24724,35.898695,0.0 -97.247223,35.898838,0.0 -97.247223,35.899087,0.0 -97.24722,35.8993,0.0 -97.247207,35.899645,0.0 -97.247185,35.900023,0.0 -97.247175,35.900288,0.0 -97.247157,35.900707,0.0 -97.247138,35.901115,0.0 -97.24713,35.901397,0.0 -97.247118,35.901832,0.0 -97.247123,35.90223,0.0 -97.247125,35.902447,0.0 -97.247127,35.902718,0.0 -97.247128,35.902915,0.0 -97.247135,35.903028,0.0 -97.247158,35.903188,0.0 -97.247183,35.903375,0.0 -97.247183,35.903545,0.0 -97.247153,35.903843,0.0 -97.247128,35.904187,0.0 -97.247117,35.904438,0.0 -97.247107,35.90485,0.0 -97.247105,35.905275,0.0 -97.247108,35.905567,0.0 -97.247117,35.906013,0.0 -97.247123,35.906475,0.0 -97.247125,35.906777,0.0 -97.247125,35.907245,0.0 -97.247123,35.907737,0.0 -97.247122,35.908065,0.0 -97.247123,35.90856,0.0 -97.24713,35.909055,0.0 -97.247132,35.909373,0.0 -97.24713,35.90985,0.0 -97.24712,35.910322,0.0 -97.247118,35.910627,0.0 -97.247122,35.911055,0.0 -97.247122,35.911468,0.0 -97.24712,35.91174,0.0 -97.247113,35.912117,0.0 -97.247113,35.912458,0.0 -97.247115,35.912665,0.0 -97.247112,35.912937,0.0 -97.24711,35.913118,0.0 -97.247147,35.91317,0.0 -97.24726,35.913148,0.0 -97.247447,35.913142,0.0 -97.247608,35.913137,0.0 -97.247912,35.913122,0.0 -97.24824,35.913118,0.0 -97.248473,35.913107,0.0 -97.248823,35.913092,0.0 -97.249178,35.913087,0.0 -97.249403,35.913088,0.0 -97.249737,35.913085,0.0 -97.250065,35.913093,0.0 -97.250283,35.913088,0.0 -97.250617,35.913077,0.0 -97.250965,35.913075,0.0 -97.251207,35.91307,0.0 -97.251568,35.913068,0.0 -97.251947,35.91306,0.0 -97.2522,35.913057,0.0 -97.252592,35.913048,0.0 -97.252975,35.913043,0.0 -97.25322,35.91304,0.0 -97.253568,35.913025,0.0 -97.253933,35.913003,0.0 -97.254188,35.912988,0.0 -97.254588,35.912975,0.0 -97.254997,35.912967,0.0 -97.255258,35.912967,0.0 -97.255617,35.912977,0.0 -97.255962,35.912985,0.0 -97.256173,35.91299,0.0 -97.256498,35.912998,0.0 -97.256818,35.913007,0.0 -97.257022,35.91301,0.0 -97.25733,35.913017,0.0 -97.257642,35.913012,0.0 -97.257842,35.913003,0.0 -97.258143,35.913003,0.0 -97.258468,35.913,0.0 -97.258693,35.912998,0.0 -97.259032,35.912992,0.0 -97.259387,35.912988,0.0 -97.259638,35.912987,0.0 -97.260048,35.912987,0.0 -97.260467,35.912985,0.0 -97.260748,35.912987,0.0 -97.261173,35.912987,0.0 -97.261628,35.912985,0.0 -97.26194,35.912983,0.0 -97.262415,35.91298,0.0 -97.262858,35.912975,0.0 -97.263143,35.912977,0.0 -97.263552,35.912973,0.0 -97.263923,35.912965,0.0 -97.264163,35.912965,0.0 -97.264488,35.912962,0.0 -97.264728,35.912967,0.0 -97.26483,35.91298,0.0 -97.264898,35.91299,0.0 -97.264895,35.912993,0.0 -97.264958,35.913018,0.0 -97.265057,35.913018,0.0 -97.265248,35.913018,0.0 -97.2655,35.913023,0.0 -97.265678,35.913025,0.0 -97.265945,35.913023,0.0 -97.266203,35.913018,0.0 -97.266355,35.913015,0.0 -97.266548,35.913018,0.0 -97.266693,35.91303,0.0 -97.266772,35.913028,0.0 -97.266912,35.913015,0.0 -97.267147,35.913007,0.0 -97.267357,35.913007,0.0 -97.26768,35.913018,0.0 -97.267902,35.913028,0.0 -97.267987,35.913032,0.0 -97.268007,35.913025,0.0 -97.268005,35.913023,0.0 -97.26793,35.91305,0.0 -97.267905,35.913052,0.0 -97.26788,35.913068,0.0 -97.267873,35.913072,0.0 -97.267865,35.913058,0.0 -97.267822,35.91303,0.0 -97.267753,35.913023,0.0 -97.267725,35.913025,0.0 -97.267692,35.913033,0.0 -97.267655,35.913035,0.0 -97.267622,35.913035,0.0 -97.267573,35.913037,0.0 -97.267547,35.913037,0.0 -97.267542,35.913037,0.0 -97.267507,35.913037,0.0 -97.26747,35.913038,0.0 -97.267435,35.913038,0.0 -97.267403,35.913038,0.0 -97.267337,35.913038,0.0 -97.267253,35.91304,0.0 -97.267198,35.913042,0.0 -97.267077,35.913043,0.0 -97.266923,35.913047,0.0 -97.266808,35.913045,0.0 -97.26663,35.913038,0.0 -97.266493,35.913035,0.0 -97.266415,35.913037,0.0 -97.26634,35.913037,0.0 -97.266288,35.913038,0.0 -97.266243,35.913038,0.0 -97.266173,35.913038,0.0 -97.26613,35.913043,0.0 -97.266118,35.913045,0.0 -97.266108,35.91305,0.0 -97.266087,35.913052,0.0 -97.26608,35.913053,0.0 -97.26602,35.913052,0.0 -97.265928,35.91304,0.0 -97.265877,35.913038,0.0 -97.26585,35.913035,0.0 -97.265843,35.913032,0.0 -97.26579,35.913037,0.0 -97.265645,35.913045,0.0 -97.265443,35.913048,0.0 -97.265283,35.913043,0.0 -97.265062,35.913048,0.0 -97.264932,35.913108,0.0 -97.264907,35.913178,0.0 -97.264892,35.913302,0.0 -97.264885,35.913407,0.0 -97.26488,35.913443,0.0 -97.26488,35.913452,0.0 -97.264893,35.913388,0.0 -97.264907,35.913328,0.0 -97.264908,35.913242,0.0 -97.264912,35.913167,0.0 -97.264908,35.91312,0.0 -97.264913,35.913057,0.0 -97.264935,35.91302,0.0 -97.264927,35.913022,0.0 -97.264858,35.913018,0.0 -97.264675,35.913007,0.0 -97.264502,35.913007,0.0 -97.264165,35.913015,0.0 -97.26377,35.913012,0.0 -97.263497,35.913017,0.0 -97.263068,35.913018,0.0 -97.262612,35.913017,0.0 -97.262307,35.913017,0.0 -97.261843,35.913018,0.0 -97.261385,35.91302,0.0 -97.261085,35.91302,0.0 -97.260657,35.913017,0.0 -97.260232,35.91302,0.0 -97.25994,35.913022,0.0 -97.25949,35.913028,0.0 -97.259033,35.913033,0.0 -97.258737,35.913038,0.0 -97.258297,35.91305,0.0 -97.25788,35.91305,0.0 -97.257608,35.913053,0.0 -97.257167,35.91306,0.0 -97.25672,35.91306,0.0 -97.256428,35.91306,0.0 -97.255988,35.913063,0.0 -97.255547,35.913057,0.0 -97.255257,35.913053,0.0 -97.254765,35.913045,0.0 -97.254217,35.913055,0.0 -97.25385,35.913062,0.0 -97.253322,35.913083,0.0 -97.252802,35.913098,0.0 -97.252442,35.913103,0.0 -97.251898,35.913108,0.0 -97.251373,35.913108,0.0 -97.251027,35.913103,0.0 -97.250507,35.913103,0.0 -97.25001,35.913107,0.0 -97.249695,35.913107,0.0 -97.249207,35.913103,0.0 -97.248667,35.91311,0.0 -97.248302,35.913113,0.0 -97.247815,35.913117,0.0 -97.24744,35.91313,0.0 -97.247257,35.913123,0.0 -97.247145,35.913128,0.0 -97.247112,35.913205,0.0 -97.247098,35.913303,0.0 -97.247093,35.913527,0.0 -97.247098,35.913838,0.0 -97.2471,35.914083,0.0 -97.247098,35.914482,0.0 -97.247098,35.914907,0.0 -97.247102,35.915203,0.0 -97.247092,35.915668,0.0 -97.247077,35.916145,0.0 -97.24707,35.916457,0.0 -97.247062,35.91691,0.0 -97.24706,35.917328,0.0 -97.247062,35.91758,0.0 -97.247067,35.91792,0.0 -97.24707,35.91816,0.0 -97.247072,35.918235,0.0 -97.247077,35.91824,0.0 -97.24708,35.918233,0.0 -97.247168,35.918198,0.0 -97.247192,35.918197,0.0 -97.247153,35.9182,0.0 -97.247103,35.918227,0.0 -97.247097,35.918233,0.0 -97.247085,35.918205,0.0 -97.24707,35.918083,0.0 -97.247072,35.91792,0.0 -97.247078,35.917602,0.0 -97.247072,35.917213,0.0 -97.247072,35.916923,0.0 -97.247075,35.916472,0.0 -97.247077,35.916008,0.0 -97.247082,35.9157,0.0 -97.24708,35.915283,0.0 -97.264838,35.917287,0.0 -97.26487,35.917383,0.0 -97.264872,35.917622,0.0 -97.264873,35.917832,0.0 -97.264863,35.918168,0.0 -97.264872,35.918523,0.0 -97.264867,35.918772,0.0 -97.264857,35.919183,0.0 -97.26486,35.919613,0.0 -97.264865,35.919888,0.0 -97.26486,35.92031,0.0 -97.264857,35.920747,0.0 -97.264847,35.921037,0.0 -97.264855,35.921498,0.0 -97.264862,35.921952,0.0 -97.264862,35.92225,0.0 -97.264868,35.92269,0.0 -97.264875,35.923113,0.0 -97.264875,35.923395,0.0 -97.264877,35.923838,0.0 -97.264872,35.924298,0.0 -97.264872,35.924607,0.0 -97.264872,35.925057,0.0 -97.26486,35.92545,0.0 -97.264858,35.925718,0.0 -97.264857,35.926095,0.0 -97.264865,35.926447,0.0 -97.264867,35.926662,0.0 -97.264872,35.926945,0.0 -97.26486,35.92716,0.0 -97.264798,35.92723,0.0 -97.264637,35.927252,0.0 -97.264398,35.927277,0.0 -97.264237,35.927353,0.0 -97.263993,35.927492,0.0 -97.263698,35.927518,0.0 -97.26346,35.927513,0.0 -97.263063,35.927517,0.0 -97.262635,35.927515,0.0 -97.26234,35.927517,0.0 -97.261867,35.927503,0.0 -97.261395,35.927498,0.0 -97.261072,35.927498,0.0 -97.260575,35.927497,0.0 -97.26009,35.927502,0.0 -97.259772,35.927498,0.0 -97.259293,35.92749,0.0 -97.258823,35.927497,0.0 -97.258502,35.927497,0.0 -97.258013,35.927495,0.0 -97.25754,35.927493,0.0 -97.257257,35.92749,0.0 -97.256867,35.927498,0.0 -97.256485,35.927528,0.0 -97.25622,35.927545,0.0 -97.255792,35.927577,0.0 -97.255405,35.927597,0.0 -97.255153,35.927587,0.0 -97.254743,35.92758,0.0 -97.254323,35.927587,0.0 -97.254042,35.927587,0.0 -97.253602,35.927588,0.0 -97.253187,35.927583,0.0 -97.25293,35.927583,0.0 -97.252512,35.92759,0.0 -97.252057,35.927592,0.0 -97.251752,35.927593,0.0 -97.251278,35.927593,0.0 -97.250792,35.9276,0.0 -97.250455,35.927602,0.0 -97.24994,35.927602,0.0 -97.249432,35.927595,0.0 -97.249113,35.92759,0.0 -97.248652,35.927587,0.0 -97.248217,35.927588,0.0 -97.24795,35.927593,0.0 -97.247588,35.927595,0.0 -97.247318,35.927595,0.0 -97.247198,35.927597,0.0 -97.247113,35.927578,0.0 -97.247065,35.927518,0.0 -97.247073,35.927443,0.0 -97.247092,35.92726,0.0 -97.247095,35.927003,0.0 -97.247088,35.926802,0.0 -97.247085,35.926487,0.0 -97.24709,35.926167,0.0 -97.247088,35.925952,0.0 -97.247075,35.925665,0.0 -97.24706,35.925437,0.0 -97.247065,35.925347,0.0 -97.247078,35.925277,0.0 -97.247082,35.925252,0.0 -97.247067,35.925322,0.0 -97.247057,35.925417,0.0 -97.247053,35.925533,0.0 -97.247055,35.925612,0.0 -97.247065,35.925745,0.0 -97.24707,35.925863,0.0 -97.247072,35.925943,0.0 -97.24707,35.926065,0.0 -97.24707,35.926185,0.0 -97.247068,35.926265,0.0 -97.247065,35.926377,0.0 -97.247067,35.926478,0.0 -97.247063,35.926558,0.0 -97.247068,35.926672,0.0 -97.247078,35.926777,0.0 -97.247077,35.92685,0.0 -97.247065,35.92698,0.0 -97.247057,35.927118,0.0 -97.247057,35.92721,0.0 -97.247052,35.927345,0.0 -97.247048,35.927457,0.0 -97.247047,35.927513,0.0 -97.247045,35.927603,0.0 -97.24704,35.927675,0.0 -97.247045,35.92769,0.0 -97.247037,35.927668,0.0 -97.246977,35.927663,0.0 -97.246808,35.927668,0.0 -97.246492,35.927675,0.0 -97.246152,35.927668,0.0 -97.245968,35.927663,0.0 -97.24579,35.92766,0.0 -97.245725,35.927658,0.0 -97.245728,35.927662,0.0 -97.245635,35.92763,0.0 -97.245547,35.92763,0.0 -97.24554,35.927633,0.0 -97.245525,35.92763,0.0 -97.245478,35.927625,0.0 -97.245362,35.927622,0.0 -97.245315,35.927663,0.0 -97.245317,35.927668,0.0 -97.245338,35.927648,0.0 -97.24535,35.92762,0.0 -97.245355,35.927628,0.0 -97.245425,35.927655,0.0 -97.24556,35.92765,0.0 -97.24573,35.927647,0.0 -97.246062,35.92765,0.0 -97.24643,35.927643,0.0 -97.246667,35.927642,0.0 -97.246925,35.92765,0.0 -97.247043,35.927665,0.0 -97.24708,35.927712,0.0 -97.247098,35.927877,0.0 -97.247092,35.928153,0.0 -97.24708,35.928385,0.0 -97.247068,35.928752,0.0 -97.24707,35.929117,0.0 -97.24707,35.929368,0.0 -97.24707,35.929768,0.0 -97.247073,35.930173,0.0 -97.247068,35.930435,0.0 -97.247062,35.930807,0.0 -97.247057,35.931162,0.0 -97.247057,35.9314,0.0 -97.247053,35.931785,0.0 -97.24705,35.93218,0.0 -97.24705,35.932457,0.0 -97.247052,35.932867,0.0 -97.247047,35.933218,0.0 -97.247047,35.9334,0.0 -97.247042,35.933597,0.0 -97.247035,35.933757,0.0 -97.247043,35.933868,0.0 -97.24706,35.934107,0.0 -97.247055,35.934407,0.0 -97.247057,35.93461,0.0 -97.24706,35.93492,0.0 -97.247053,35.935258,0.0 -97.247052,35.935535,0.0 -97.24705,35.935973,0.0 -97.247042,35.936428,0.0 -97.247035,35.936728,0.0 -97.247032,35.937178,0.0 -97.24703,35.937618,0.0 -97.247035,35.937882,0.0 -97.247043,35.938235,0.0 -97.247042,35.93855,0.0 -97.247032,35.938738,0.0 -97.247028,35.938995,0.0 -97.24703,35.93922,0.0 -97.247027,35.939333,0.0 -97.24703,35.939493,0.0 -97.247038,35.939742,0.0 -97.247037,35.939953,0.0 -97.24703,35.940302,0.0 -97.247028,35.940678,0.0 -97.24703,35.94092,0.0 -97.24703,35.941268,0.0 -97.247027,35.941615,0.0 -97.247018,35.941813,0.0 -97.247007,35.941993,0.0 -97.247003,35.942058,0.0 -97.247005,35.94208,0.0 -97.246932,35.94213,0.0 -97.246748,35.942138,0.0 -97.246568,35.942137,0.0 -97.246227,35.942132,0.0 -97.245853,35.942133,0.0 -97.245615,35.942135,0.0 -97.245272,35.942138,0.0 -97.244937,35.942135,0.0 -97.244718,35.942137,0.0 -97.244405,35.942142,0.0 -97.244108,35.942147,0.0 -97.243907,35.942145,0.0 -97.24367,35.942143,0.0 -97.243518,35.94214,0.0 -97.243457,35.942143,0.0 -97.243392,35.94215,0.0 -97.243337,35.942183,0.0 -97.243302,35.942215,0.0 -97.243278,35.942247,0.0 -97.243268,35.942248,0.0 -97.243297,35.942213,0.0 -97.2433,35.9422,0.0 -97.243308,35.942192,0.0 -97.243315,35.942175,0.0 -97.243315,35.942145,0.0 -97.243312,35.94213,0.0 -97.243323,35.942125,0.0 -97.24337,35.94212,0.0 -97.243382,35.942123,0.0 -97.243353,35.942123,0.0 -97.243283,35.94211,0.0 -97.243258,35.942112,0.0 -97.24326,35.942117,0.0</coordinates>
+                </LineString>
+            </Placemark>
+        </Folder>
+        <Folder id="8269">
+            <name>Centerline</name>
+        </Folder>
+        <Placemark id="8271">
+            <styleUrl>#8272</styleUrl>
+            <LineString id="8270">
+                <coordinates>-97.4260009999999,35.855364,0.0 -97.426008,35.855364,0.0 -97.426015,35.855364,0.0 -97.426026,35.855365,0.0 -97.4260359999999,35.855365,0.0 -97.4260639999999,35.855364,0.0 -97.42608,35.855364,0.0 -97.4261079999999,35.855364,0.0 -97.426152,35.855365,0.0 -97.4261669999999,35.855365,0.0 -97.426187,35.855365,0.0 -97.426365,35.855365,0.0 -97.434072,35.855396,0.0 -97.434057,35.854608,0.0 -97.434537,35.854608,0.0 -97.434928,35.854608,0.0 -97.435157,35.854609,0.0 -97.437594,35.851965,0.0 -97.4383529999999,35.851939,0.0 -97.439134,35.851395,0.0 -97.439732,35.850979,0.0 -97.440329,35.850562,0.0 -97.440713,35.850295,0.0 -97.441274,35.849905,0.0 -97.442271,35.849595,0.0 -97.443326,35.849268,0.0 -97.449431,35.845984,0.0 -97.4508219999999,35.845173,0.0 -97.4571209999999,35.842273,0.0 -97.457475,35.84207,0.0 -97.457478,35.842069,0.0 -97.457938,35.841805,0.0 -97.45793,35.841748,0.0 -97.45849,35.841451,0.0 -97.458562,35.84149,0.0 -97.4588729999999,35.841283,0.0 -97.458875,35.841281,0.0 -97.460325,35.840312,0.0 -97.46031,35.839943,0.0 -97.4639009999999,35.838144,0.0 -97.465164,35.837511,0.0 -97.471802,35.833676,0.0 -97.477329,35.829616,0.0 -97.482297,35.826822,0.0 -97.48647,35.824475,0.0 -97.48824,35.82331,0.0 -97.493063,35.820134,0.0 -97.493882,35.819595,0.0 -97.493898,35.819585,0.0 -97.495335,35.819349,0.0 -97.497997,35.817099,0.0 -97.504235,35.812997,0.0 -97.504458,35.81285,0.0 -97.506923,35.811229,0.0 -97.513834,35.806541,0.0 -97.5188399999999,35.803579,0.0 -97.522154,35.801618,0.0 -97.5266669999999,35.798533,0.0 -97.527283,35.798111,0.0 -97.527413,35.798112,0.0 -97.527745,35.798114,0.0 -97.527914,35.798115,0.0 -97.527921,35.798115,0.0 -97.528273,35.798118,0.0 -97.528722,35.798121,0.0 -97.528814,35.798121,0.0 -97.5291039999999,35.798104,0.0 -97.529182,35.798015,0.0 -97.5292079999999,35.798015,0.0 -97.529244,35.798014,0.0 -97.5292649999999,35.798014,0.0 -97.52927,35.798014,0.0 -97.529284,35.798014,0.0 -97.529292,35.798014,0.0 -97.5293,35.798014,0.0 -97.529325,35.798014,0.0 -97.529327,35.798023,0.0 -97.529328,35.798033,0.0 -97.529333,35.798059,0.0 -97.529343,35.798059,0.0 -97.529415,35.798059,0.0 -97.243275,35.942244,0.0 -97.243482,35.935259,0.0 -97.244495,35.931813,0.0 -97.244917,35.930376,0.0 -97.245041,35.929954,0.0 -97.245265,35.929074,0.0 -97.245272,35.929046,0.0 -97.246067,35.925921,0.0 -97.246069,35.925912,0.0 -97.246697,35.92563,0.0 -97.246718,35.925621,0.0 -97.246723,35.925618,0.0 -97.257605,35.920374,0.0 -97.265138,35.917207,0.0 -97.2651479999999,35.917202,0.0 -97.267851,35.913182,0.0 -97.267867,35.913159,0.0 -97.2695469999999,35.913124,0.0 -97.2697799999999,35.913119,0.0 -97.26979,35.913119,0.0 -97.26979,35.911717,0.0 -97.269792,35.90941,0.0 -97.269792,35.909402,0.0 -97.27151,35.905425,0.0 -97.271514,35.905417,0.0 -97.275635,35.903882,0.0 -97.275642,35.903879,0.0 -97.2759719999999,35.903844,0.0 -97.275976,35.903844,0.0 -97.276255,35.903888,0.0 -97.2762579999999,35.903888,0.0 -97.28085,35.906154,0.0 -97.280863,35.90616,0.0 -97.281037,35.906821,0.0 -97.28104,35.906829,0.0 -97.283235,35.909192,0.0 -97.283243,35.909201,0.0 -97.2843809999999,35.908659,0.0 -97.285133,35.908302,0.0 -97.285266,35.908238,0.0 -97.286053,35.907864,0.0 -97.2871199999999,35.907357,0.0 -97.292523,35.904786,0.0 -97.294937,35.903638,0.0 -97.294954,35.90363,0.0 -97.295765,35.902992,0.0 -97.300148,35.901192,0.0 -97.309595,35.896889,0.0 -97.309612,35.896881,0.0 -97.309584,35.896351,0.0 -97.309544,35.895574,0.0 -97.309543,35.895557,0.0 -97.3124819999999,35.895524,0.0 -97.3125449999999,35.895524,0.0 -97.312553,35.895524,0.0 -97.312756,35.895431,0.0 -97.31787,35.893108,0.0 -97.3184,35.892866,0.0 -97.323995,35.889937,0.0 -97.328831,35.888239,0.0 -97.330427,35.887451,0.0 -97.335364,35.885014,0.0 -97.335535,35.884889,0.0 -97.337881,35.88318,0.0 -97.347446,35.879277,0.0 -97.352302,35.877185,0.0 -97.353416,35.876632,0.0 -97.354443,35.876122,0.0 -97.35478,35.875959,0.0 -97.355768,35.87548,0.0 -97.3601779999999,35.873345,0.0 -97.360771,35.873058,0.0 -97.360809,35.87304,0.0 -97.360825,35.873032,0.0 -97.361058,35.872932,0.0 -97.362906,35.872137,0.0 -97.3641,35.871624,0.0 -97.367736,35.868505,0.0 -97.371584,35.86623,0.0 -97.37187,35.866184,0.0 -97.372197,35.86613,0.0 -97.373014,35.865998,0.0 -97.373973,35.865842,0.0 -97.374238,35.865712,0.0 -97.374659,35.865504,0.0 -97.375032,35.86532,0.0 -97.380857,35.863514,0.0 -97.387486,35.861457,0.0 -97.389232,35.860916,0.0 -97.3936979999999,35.85945,0.0 -97.393716,35.859444,0.0 -97.393739,35.859403,0.0 -97.3937459999999,35.859391,0.0 -97.393795,35.859374,0.0 -97.395008,35.858958,0.0 -97.395278,35.858866,0.0 -97.395292,35.858861,0.0 -97.395461,35.858869,0.0 -97.395476,35.85887,0.0 -97.396347,35.858579,0.0 -97.396654,35.858476,0.0 -97.396971,35.85837,0.0 -97.399114,35.857653,0.0 -97.399127,35.857649,0.0 -97.40015,35.857453,0.0 -97.400295,35.857425,0.0 -97.402281,35.857435,0.0 -97.402453,35.857436,0.0 -97.4071259999999,35.857458,0.0 -97.411596,35.857497,0.0 -97.412653,35.857507,0.0 -97.412762,35.857508,0.0 -97.4130319999999,35.85751,0.0 -97.4149279999999,35.857527,0.0 -97.41818,35.857456,0.0 -97.420375,35.857306,0.0 -97.423407,35.856879,0.0 -97.4240729999999,35.856785,0.0 -97.424097,35.856782,0.0 -97.424099,35.856375,0.0 -97.424099,35.856353,0.0 -97.4248969999999,35.856356,0.0 -97.425214,35.856358,0.0 -97.425239,35.856358,0.0 -97.42524,35.856377,0.0 -97.42524,35.856387,0.0 -97.4256079999999,35.856383,0.0 -97.425627,35.856383,0.0 -97.4256829999999,35.856334,0.0 -97.425697,35.856322,0.0 -97.425698,35.855585,0.0 -97.425698,35.855555,0.0 -97.4257779999999,35.855554,0.0 -97.425781,35.855554,0.0 -97.425783,35.855371,0.0 -97.425783,35.85536,0.0 -97.425792,35.85536,0.0 -97.425862,35.855359,0.0 -97.425889,35.855359,0.0 -97.425915,35.855359,0.0 -97.425937,35.855358,0.0 -97.425948,35.855358,0.0 -97.425996,35.855358,0.0 -97.426003,35.855358,0.0</coordinates>
+            </LineString>
+        </Placemark>
+        <Folder id="8274">
+            <Style id="8277">
+                <IconStyle id="8279">
+                    <colorMode>normal</colorMode>
+                    <scale>1</scale>
+                    <heading>0</heading>
+                    <Icon id="8280">
+                        <href>http://www.earthpoint.us/Dots/GoogleEarth/pal3/icon62.png</href>
+                    </Icon>
+                </IconStyle>
+                <LabelStyle id="8281">
+                    <color>00ffffff</color>
+                    <colorMode>normal</colorMode>
+                    <scale>0.01</scale>
+                </LabelStyle>
+                <BalloonStyle>
+                    <text>$[name]</text>
+                    <displayMode>default</displayMode>
+                </BalloonStyle>
+            </Style>
+            <Style id="8284">
+                <IconStyle id="8286">
+                    <colorMode>normal</colorMode>
+                    <scale>1</scale>
+                    <heading>0</heading>
+                    <Icon id="8287">
+                        <href>http://www.earthpoint.us/Dots/GoogleEarth/pal3/icon62.png</href>
+                    </Icon>
+                </IconStyle>
+                <LabelStyle id="8288">
+                    <color>00ffffff</color>
+                    <colorMode>normal</colorMode>
+                    <scale>0.01</scale>
+                </LabelStyle>
+                <BalloonStyle>
+                    <text>$[name]</text>
+                    <displayMode>default</displayMode>
+                </BalloonStyle>
+            </Style>
+            <Style id="8291">
+                <IconStyle id="8293">
+                    <colorMode>normal</colorMode>
+                    <scale>1</scale>
+                    <heading>0</heading>
+                    <Icon id="8294">
+                        <href>http://www.earthpoint.us/Dots/GoogleEarth/pal3/icon62.png</href>
+                    </Icon>
+                </IconStyle>
+                <LabelStyle id="8295">
+                    <color>00ffffff</color>
+                    <colorMode>normal</colorMode>
+                    <scale>0.01</scale>
+                </LabelStyle>
+                <BalloonStyle>
+                    <text>$[name]</text>
+                    <displayMode>default</displayMode>
+                </BalloonStyle>
+            </Style>
+            <Style id="8298">
+                <IconStyle id="8300">
+                    <colorMode>normal</colorMode>
+                    <scale>1</scale>
+                    <heading>0</heading>
+                    <Icon id="8301">
+                        <href>http://www.earthpoint.us/Dots/GoogleEarth/pal3/icon62.png</href>
+                    </Icon>
+                </IconStyle>
+                <LabelStyle id="8302">
+                    <color>00ffffff</color>
+                    <colorMode>normal</colorMode>
+                    <scale>0.01</scale>
+                </LabelStyle>
+                <BalloonStyle>
+                    <text>$[name]</text>
+                    <displayMode>default</displayMode>
+                </BalloonStyle>
+            </Style>
+            <Style id="8305">
+                <IconStyle id="8307">
+                    <colorMode>normal</colorMode>
+                    <scale>1</scale>
+                    <heading>0</heading>
+                    <Icon id="8308">
+                        <href>http://www.earthpoint.us/Dots/GoogleEarth/pal3/icon62.png</href>
+                    </Icon>
+                </IconStyle>
+                <LabelStyle id="8309">
+                    <color>00ffffff</color>
+                    <colorMode>normal</colorMode>
+                    <scale>0.01</scale>
+                </LabelStyle>
+                <BalloonStyle>
+                    <text>$[name]</text>
+                    <displayMode>default</displayMode>
+                </BalloonStyle>
+            </Style>
+            <Style id="8312">
+                <IconStyle id="8314">
+                    <colorMode>normal</colorMode>
+                    <scale>1</scale>
+                    <heading>0</heading>
+                    <Icon id="8315">
+                        <href>http://www.earthpoint.us/Dots/GoogleEarth/pal3/icon62.png</href>
+                    </Icon>
+                </IconStyle>
+                <LabelStyle id="8316">
+                    <color>00ffffff</color>
+                    <colorMode>normal</colorMode>
+                    <scale>0.01</scale>
+                </LabelStyle>
+                <BalloonStyle>
+                    <text>$[name]</text>
+                    <displayMode>default</displayMode>
+                </BalloonStyle>
+            </Style>
+            <Style id="8319">
+                <IconStyle id="8321">
+                    <colorMode>normal</colorMode>
+                    <scale>1</scale>
+                    <heading>0</heading>
+                    <Icon id="8322">
+                        <href>http://www.earthpoint.us/Dots/GoogleEarth/pal3/icon62.png</href>
+                    </Icon>
+                </IconStyle>
+                <LabelStyle id="8323">
+                    <color>00ffffff</color>
+                    <colorMode>normal</colorMode>
+                    <scale>0.01</scale>
+                </LabelStyle>
+                <BalloonStyle>
+                    <text>$[name]</text>
+                    <displayMode>default</displayMode>
+                </BalloonStyle>
+            </Style>
+            <Style id="8326">
+                <IconStyle id="8328">
+                    <colorMode>normal</colorMode>
+                    <scale>1</scale>
+                    <heading>0</heading>
+                    <Icon id="8329">
+                        <href>http://www.earthpoint.us/Dots/GoogleEarth/pal3/icon62.png</href>
+                    </Icon>
+                </IconStyle>
+                <LabelStyle id="8330">
+                    <color>00ffffff</color>
+                    <colorMode>normal</colorMode>
+                    <scale>0.01</scale>
+                </LabelStyle>
+                <BalloonStyle>
+                    <text>$[name]</text>
+                    <displayMode>default</displayMode>
+                </BalloonStyle>
+            </Style>
+            <Style id="8333">
+                <IconStyle id="8335">
+                    <colorMode>normal</colorMode>
+                    <scale>1</scale>
+                    <heading>0</heading>
+                    <Icon id="8336">
+                        <href>http://www.earthpoint.us/Dots/GoogleEarth/pal3/icon62.png</href>
+                    </Icon>
+                </IconStyle>
+                <LabelStyle id="8337">
+                    <color>00ffffff</color>
+                    <colorMode>normal</colorMode>
+                    <scale>0.01</scale>
+                </LabelStyle>
+                <BalloonStyle>
+                    <text>$[name]</text>
+                    <displayMode>default</displayMode>
+                </BalloonStyle>
+            </Style>
+            <Style id="8340">
+                <IconStyle id="8342">
+                    <colorMode>normal</colorMode>
+                    <scale>1</scale>
+                    <heading>0</heading>
+                    <Icon id="8343">
+                        <href>http://www.earthpoint.us/Dots/GoogleEarth/pal3/icon62.png</href>
+                    </Icon>
+                </IconStyle>
+                <LabelStyle id="8344">
+                    <color>00ffffff</color>
+                    <colorMode>normal</colorMode>
+                    <scale>0.01</scale>
+                </LabelStyle>
+                <BalloonStyle>
+                    <text>$[name]</text>
+                    <displayMode>default</displayMode>
+                </BalloonStyle>
+            </Style>
+            <Style id="8347">
+                <IconStyle id="8349">
+                    <colorMode>normal</colorMode>
+                    <scale>1</scale>
+                    <heading>0</heading>
+                    <Icon id="8350">
+                        <href>http://www.earthpoint.us/Dots/GoogleEarth/pal3/icon62.png</href>
+                    </Icon>
+                </IconStyle>
+                <LabelStyle id="8351">
+                    <color>00ffffff</color>
+                    <colorMode>normal</colorMode>
+                    <scale>0.01</scale>
+                </LabelStyle>
+                <BalloonStyle>
+                    <text>$[name]</text>
+                    <displayMode>default</displayMode>
+                </BalloonStyle>
+            </Style>
+            <Style id="8354">
+                <IconStyle id="8356">
+                    <colorMode>normal</colorMode>
+                    <scale>1</scale>
+                    <heading>0</heading>
+                    <Icon id="8357">
+                        <href>http://www.earthpoint.us/Dots/GoogleEarth/pal3/icon62.png</href>
+                    </Icon>
+                </IconStyle>
+                <LabelStyle id="8358">
+                    <color>00ffffff</color>
+                    <colorMode>normal</colorMode>
+                    <scale>0.01</scale>
+                </LabelStyle>
+                <BalloonStyle>
+                    <text>$[name]</text>
+                    <displayMode>default</displayMode>
+                </BalloonStyle>
+            </Style>
+            <Style id="8361">
+                <IconStyle id="8363">
+                    <colorMode>normal</colorMode>
+                    <scale>1</scale>
+                    <heading>0</heading>
+                    <Icon id="8364">
+                        <href>http://www.earthpoint.us/Dots/GoogleEarth/pal3/icon62.png</href>
+                    </Icon>
+                </IconStyle>
+                <LabelStyle id="8365">
+                    <color>00ffffff</color>
+                    <colorMode>normal</colorMode>
+                    <scale>0.01</scale>
+                </LabelStyle>
+                <BalloonStyle>
+                    <text>$[name]</text>
+                    <displayMode>default</displayMode>
+                </BalloonStyle>
+            </Style>
+            <Style id="8368">
+                <IconStyle id="8370">
+                    <colorMode>normal</colorMode>
+                    <scale>1</scale>
+                    <heading>0</heading>
+                    <Icon id="8371">
+                        <href>http://www.earthpoint.us/Dots/GoogleEarth/pal3/icon62.png</href>
+                    </Icon>
+                </IconStyle>
+                <LabelStyle id="8372">
+                    <color>00ffffff</color>
+                    <colorMode>normal</colorMode>
+                    <scale>0.01</scale>
+                </LabelStyle>
+                <BalloonStyle>
+                    <text>$[name]</text>
+                    <displayMode>default</displayMode>
+                </BalloonStyle>
+            </Style>
+            <Style id="8375">
+                <IconStyle id="8377">
+                    <colorMode>normal</colorMode>
+                    <scale>1</scale>
+                    <heading>0</heading>
+                    <Icon id="8378">
+                        <href>http://www.earthpoint.us/Dots/GoogleEarth/pal3/icon62.png</href>
+                    </Icon>
+                </IconStyle>
+                <LabelStyle id="8379">
+                    <color>00ffffff</color>
+                    <colorMode>normal</colorMode>
+                    <scale>0.01</scale>
+                </LabelStyle>
+                <BalloonStyle>
+                    <text>$[name]</text>
+                    <displayMode>default</displayMode>
+                </BalloonStyle>
+            </Style>
+            <Style id="8382">
+                <IconStyle id="8384">
+                    <colorMode>normal</colorMode>
+                    <scale>1</scale>
+                    <heading>0</heading>
+                    <Icon id="8385">
+                        <href>http://www.earthpoint.us/Dots/GoogleEarth/pal3/icon62.png</href>
+                    </Icon>
+                </IconStyle>
+                <LabelStyle id="8386">
+                    <color>00ffffff</color>
+                    <colorMode>normal</colorMode>
+                    <scale>0.01</scale>
+                </LabelStyle>
+                <BalloonStyle>
+                    <text>$[name]</text>
+                    <displayMode>default</displayMode>
+                </BalloonStyle>
+            </Style>
+            <name>Notes</name>
+            <Placemark id="8276">
+                <name>OGT Key</name>
+                <description>OGT Key</description>
+                <styleUrl>#8277</styleUrl>
+                <Point id="8275">
+                    <coordinates>-97.529415,35.798059,0.0</coordinates>
+                </Point>
+            </Placemark>
+            <Placemark id="8283">
+                <name>Gate Open During survey 01/27/26</name>
+                <description>Gate Open During survey 01/27/26</description>
+                <styleUrl>#8284</styleUrl>
+                <Point id="8282">
+                    <coordinates>-97.502235,35.812991,0.0</coordinates>
+                </Point>
+            </Placemark>
+            <Placemark id="8290">
+                <name>electric Gate</name>
+                <description>electric Gate</description>
+                <styleUrl>#8291</styleUrl>
+                <Point id="8289">
+                    <coordinates>-97.489405,35.823865,0.0</coordinates>
+                </Point>
+            </Placemark>
+            <Placemark id="8297">
+                <name>Gate Unlocked</name>
+                <description>Gate Unlocked</description>
+                <styleUrl>#8298</styleUrl>
+                <Point id="8296">
+                    <coordinates>-97.460505,35.835863,0.0</coordinates>
+                </Point>
+            </Placemark>
+            <Placemark id="8304">
+                <name>OGT Key</name>
+                <description>OGT Key</description>
+                <styleUrl>#8305</styleUrl>
+                <Point id="8303">
+                    <coordinates>-97.425545,35.855494,0.0</coordinates>
+                </Point>
+            </Placemark>
+            <Placemark id="8311">
+                <name>Gate Open</name>
+                <description>Gate Open</description>
+                <styleUrl>#8312</styleUrl>
+                <Point id="8310">
+                    <coordinates>-97.371781,35.867006,0.0</coordinates>
+                </Point>
+            </Placemark>
+            <Placemark id="8318">
+                <name>Park In Driveway during Track Contact Randy Hood 405-520-6263</name>
+                <description>Park In Driveway during Track Contact Randy Hood 405-520-6263</description>
+                <styleUrl>#8319</styleUrl>
+                <Point id="8317">
+                    <coordinates>-97.370181,35.867121,0.0</coordinates>
+                </Point>
+            </Placemark>
+            <Placemark id="8325">
+                <name>Gate Open</name>
+                <description>Gate Open</description>
+                <styleUrl>#8326</styleUrl>
+                <Point id="8324">
+                    <coordinates>-97.342708,35.884024,0.0</coordinates>
+                </Point>
+            </Placemark>
+            <Placemark id="8332">
+                <name>Gate Open During Survey</name>
+                <description>Gate Open During Survey</description>
+                <styleUrl>#8333</styleUrl>
+                <Point id="8331">
+                    <coordinates>-97.332402,35.8846,0.0</coordinates>
+                </Point>
+            </Placemark>
+            <Placemark id="8339">
+                <name>Gate Unlocked</name>
+                <description>Gate Unlocked</description>
+                <styleUrl>#8340</styleUrl>
+                <Point id="8338">
+                    <coordinates>-97.289703,35.902409,0.0</coordinates>
+                </Point>
+            </Placemark>
+            <Placemark id="8346">
+                <name>Follow This Drive</name>
+                <description>Follow This Drive</description>
+                <styleUrl>#8347</styleUrl>
+                <Point id="8345">
+                    <coordinates>-97.28968,35.902052,0.0</coordinates>
+                </Point>
+            </Placemark>
+            <Placemark id="8353">
+                <name>Gate Unlocked</name>
+                <description>Gate Unlocked</description>
+                <styleUrl>#8354</styleUrl>
+                <Point id="8352">
+                    <coordinates>-97.287446,35.898985,0.0</coordinates>
+                </Point>
+            </Placemark>
+            <Placemark id="8360">
+                <name>Gate Unlocked</name>
+                <description>Gate Unlocked</description>
+                <styleUrl>#8361</styleUrl>
+                <Point id="8359">
+                    <coordinates>-97.28502,35.900379,0.0</coordinates>
+                </Point>
+            </Placemark>
+            <Placemark id="8367">
+                <name>call 712-389-4867</name>
+                <description>call 712-389-4867</description>
+                <styleUrl>#8368</styleUrl>
+                <Point id="8366">
+                    <coordinates>-97.282744,35.900173,0.0</coordinates>
+                </Point>
+            </Placemark>
+            <Placemark id="8374">
+                <name>Gate unlocked</name>
+                <description>Gate unlocked</description>
+                <styleUrl>#8375</styleUrl>
+                <Point id="8373">
+                    <coordinates>-97.273897,35.900097,0.0</coordinates>
+                </Point>
+            </Placemark>
+            <Placemark id="8381">
+                <name>call Bobby Davison 405-990-4176</name>
+                <description>call Bobby Davison 405-990-4176</description>
+                <styleUrl>#8382</styleUrl>
+                <Point id="8380">
+                    <coordinates>-97.274115,35.898488,0.0</coordinates>
+                </Point>
+            </Placemark>
+        </Folder>
+    </Document>
+</kml>
