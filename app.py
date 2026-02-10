@@ -85,10 +85,16 @@ def set_icon_style(point, icon_value):
     if not v:
         return False
     try:
-        point.style.iconstyle.icon.href = v
+        # always coerce to str to avoid pandas types
+        point.style.iconstyle.icon.href = str(v)
+        # ensure icon scale is reasonable
+        try:
+            point.style.iconstyle.scale = 1
+        except:
+            pass
         return True
     except Exception:
-        # ensure we always pass a string; try str() fallback
+        # fallback: try str() explicitly
         try:
             point.style.iconstyle.icon.href = str(v)
             return True
@@ -269,7 +275,7 @@ if st.button("Generate KMZ"):
                       hide_label=False,
                       format_agm=True)
 
-    # Access
+    # Access (multi-segment)
     if df_access is not None:
         folder = kml.newfolder(name="Access")
         created = add_multisegment_linestrings(folder, df_access)
@@ -277,11 +283,29 @@ if st.button("Generate KMZ"):
             for _, row in df_access.iterrows():
                 add_point(folder, row)
 
-    # Centerline
+    # Centerline (single LineString using all non-empty coords in order)
     if df_center is not None:
         folder = kml.newfolder(name="Centerline")
-        created = add_multisegment_linestrings(folder, df_center)
-        if not created:
+        coords = []
+        for _, row in df_center.iterrows():
+            lat = row.get("Latitude")
+            lon = row.get("Longitude")
+            if pd.isna(lat) or pd.isna(lon):
+                continue
+            try:
+                coords.append((float(lon), float(lat)))
+            except:
+                continue
+        if len(coords) >= 2:
+            ls = folder.newlinestring()
+            ls.coords = coords
+            # apply color if present
+            if "LineStringColor" in df_center.columns:
+                non_null = df_center["LineStringColor"].dropna().astype(str).str.strip()
+                if len(non_null) > 0:
+                    set_linestring_style(ls, non_null.iloc[0])
+        else:
+            # fallback to points if not enough coords
             for _, row in df_center.iterrows():
                 add_point(folder, row)
 
