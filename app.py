@@ -7,7 +7,7 @@ import simplekml
 st.set_page_config(page_title="KMZ Generator", layout="wide")
 
 st.title("KMZ Generator")
-st.write("Upload your Google Earth Seed File and generate a KMZ with folders and icons.")
+st.write("Upload your Google Earth Seed File and generate a KMZ with Earthpoint‑style folders and icons.")
 
 # -----------------------------
 # Helpers
@@ -24,25 +24,20 @@ KML_COLOR_MAP = {
 }
 
 def safe_str(val):
-    """Return a stripped string if val is not null; otherwise return None."""
     if pd.isna(val):
         return None
-    s = str(val)
-    s = s.strip()
+    s = str(val).strip()
     return s if s != "" else None
 
 def set_icon_style(point, icon_href):
-    """Set icon href only if it's a valid string."""
     href = safe_str(icon_href)
     if href:
         try:
             point.style.iconstyle.icon.href = href
         except Exception:
-            # If simplekml rejects the href for any reason, skip it silently
             pass
 
 def set_icon_color(point, color_value):
-    """Set icon color if valid color name or KML color string."""
     c = safe_str(color_value)
     if not c:
         return
@@ -50,7 +45,6 @@ def set_icon_color(point, color_value):
     if c_lower in KML_COLOR_MAP:
         point.style.iconstyle.color = KML_COLOR_MAP[c_lower]
     else:
-        # If user provided a KML color string (aabbggrr) use it if it looks valid
         if len(c) == 8 and all(ch in "0123456789abcdefABCDEF" for ch in c):
             point.style.iconstyle.color = c
 
@@ -68,7 +62,6 @@ def set_linestring_style(linestring, color_value):
             linestring.style.linestyle.width = 3
 
 def add_point(kml_folder, row, name_field="Name", icon_field="Icon", color_field="IconColor"):
-    """Adds a point placemark to a KML folder with safe checks."""
     lat = row.get("Latitude", None)
     lon = row.get("Longitude", None)
     if pd.isna(lat) or pd.isna(lon):
@@ -81,21 +74,15 @@ def add_point(kml_folder, row, name_field="Name", icon_field="Icon", color_field
 
     p = kml_folder.newpoint()
     name_val = safe_str(row.get(name_field, None))
-    if name_val:
-        p.name = name_val
-    else:
-        p.name = ""
-
+    p.name = name_val or ""
     p.coords = [(lon_f, lat_f)]
-
-    # Icon href
     set_icon_style(p, row.get(icon_field, None))
-
-    # Icon color
-    set_icon_color(p, row.get(color_field, None))
+    if color_field:
+        set_icon_color(p, row.get(color_field, None))
 
 def add_linestring(kml_folder, df):
-    """Adds a LineString to a KML folder with safe checks."""
+    if df is None:
+        return
     df_clean = df.dropna(subset=["Latitude", "Longitude"])
     coords = []
     for _, row in df_clean.iterrows():
@@ -111,8 +98,6 @@ def add_linestring(kml_folder, df):
 
     ls = kml_folder.newlinestring()
     ls.coords = coords
-
-    # Use first non-null LineStringColor if present
     if "LineStringColor" in df.columns:
         non_null_colors = df["LineStringColor"].dropna().astype(str).str.strip()
         if len(non_null_colors) > 0:
@@ -132,66 +117,87 @@ if uploaded:
 
     st.success("Template loaded successfully.")
 
-    # Normalize sheet name keys to uppercase for consistent access
+    # Normalize sheet names to uppercase keys for consistent access
     normalized = {k.strip().upper(): v for k, v in df_dict.items()}
+
+    # Helper to safely get a dataframe by several possible keys
+    def get_sheet(*keys):
+        for k in keys:
+            if k is None:
+                continue
+            key_up = k.strip().upper()
+            df = normalized.get(key_up)
+            if df is not None and not df.empty:
+                return df
+        return None
+
+    df_agms = get_sheet("AGMs", "AGMS", "AGM")
+    df_access = get_sheet("ACCESS", "Access")
+    df_center = get_sheet("CENTERLINE", "Centerline")
+    df_notes = get_sheet("NOTES", "Notes")
 
     tab1, tab2, tab3, tab4 = st.tabs(["AGMs", "Access", "Centerline", "Notes"])
 
     with tab1:
         st.subheader("AGMs")
-        st.dataframe(normalized.get("AGMS") or normalized.get("AGMs") or normalized.get("AGMs".upper()))
+        if df_agms is not None:
+            st.dataframe(df_agms)
+        else:
+            st.info("No AGMs sheet found or sheet is empty.")
 
     with tab2:
         st.subheader("Access")
-        st.dataframe(normalized.get("ACCESS"))
+        if df_access is not None:
+            st.dataframe(df_access)
+        else:
+            st.info("No ACCESS sheet found or sheet is empty.")
 
     with tab3:
         st.subheader("Centerline")
-        st.dataframe(normalized.get("CENTERLINE"))
+        if df_center is not None:
+            st.dataframe(df_center)
+        else:
+            st.info("No CENTERLINE sheet found or sheet is empty.")
 
     with tab4:
         st.subheader("Notes")
-        st.dataframe(normalized.get("NOTES"))
+        if df_notes is not None:
+            st.dataframe(df_notes)
+        else:
+            st.info("No NOTES sheet found or sheet is empty.")
 
     if st.button("Generate KMZ"):
         kml = simplekml.Kml()
 
         # AGMs points
-        if "AGMS" in normalized or "AGMS".upper() in normalized:
-            df_agms = normalized.get("AGMS") or normalized.get("AGMS".upper()) or normalized.get("AGMs")
-            if df_agms is not None:
-                folder = kml.newfolder(name="AGMs")
-                for _, row in df_agms.iterrows():
-                    add_point(folder, row, name_field="Name", icon_field="Icon", color_field="IconColor")
+        if df_agms is not None:
+            folder = kml.newfolder(name="AGMs")
+            for _, row in df_agms.iterrows():
+                add_point(folder, row, name_field="Name", icon_field="Icon", color_field="IconColor")
 
-        # ACCESS as LineString (or points if only single)
-        if "ACCESS" in normalized:
-            df_access = normalized["ACCESS"]
+        # ACCESS as LineString or points
+        if df_access is not None:
             folder = kml.newfolder(name="Access")
-            if df_access is not None and len(df_access.dropna(subset=["Latitude", "Longitude"])) > 1:
+            if len(df_access.dropna(subset=["Latitude", "Longitude"])) > 1:
                 add_linestring(folder, df_access)
             else:
-                # fallback to points if only single coordinate rows
-                for _, row in (df_access or pd.DataFrame()).iterrows():
+                for _, row in df_access.iterrows():
                     add_point(folder, row)
 
-        # CENTERLINE as LineString
-        if "CENTERLINE" in normalized:
-            df_center = normalized["CENTERLINE"]
+        # CENTERLINE as LineString or points
+        if df_center is not None:
             folder = kml.newfolder(name="Centerline")
-            if df_center is not None and len(df_center.dropna(subset=["Latitude", "Longitude"])) > 1:
+            if len(df_center.dropna(subset=["Latitude", "Longitude"])) > 1:
                 add_linestring(folder, df_center)
             else:
-                for _, row in (df_center or pd.DataFrame()).iterrows():
+                for _, row in df_center.iterrows():
                     add_point(folder, row)
 
         # NOTES points
-        if "NOTES" in normalized:
-            df_notes = normalized["NOTES"]
+        if df_notes is not None:
             folder = kml.newfolder(name="Notes")
-            if df_notes is not None:
-                for _, row in df_notes.iterrows():
-                    add_point(folder, row, name_field="Name", icon_field="Icon", color_field=None)
+            for _, row in df_notes.iterrows():
+                add_point(folder, row, name_field="Name", icon_field="Icon", color_field=None)
 
         # Package KMZ
         kmz_bytes = io.BytesIO()
