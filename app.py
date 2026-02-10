@@ -5,9 +5,8 @@ import io
 import simplekml
 
 st.set_page_config(page_title="KMZ Generator", layout="wide")
-
 st.title("KMZ Generator")
-st.write("Upload your Google Earth Seed File and generate a KMZ with Earthpoint‑style folders and icons.")
+st.write("Upload your Google Earth Seed File and generate a KMZ with folders and icons.")
 
 # -----------------------------
 # Helpers
@@ -61,7 +60,7 @@ def set_linestring_style(linestring, color_value):
             linestring.style.linestyle.color = c
             linestring.style.linestyle.width = 3
 
-def add_point(kml_folder, row, name_field="Name", icon_field="Icon", color_field="IconColor"):
+def add_point(kml_folder, row, name_field="Name", icon_field="Icon", color_field="IconColor", hide_name_on_load=False):
     lat = row.get("Latitude", None)
     lon = row.get("Longitude", None)
     if pd.isna(lat) or pd.isna(lon):
@@ -80,28 +79,55 @@ def add_point(kml_folder, row, name_field="Name", icon_field="Icon", color_field
     if color_field:
         set_icon_color(p, row.get(color_field, None))
 
-def add_linestring(kml_folder, df):
+    # Hide label until user interacts (mouse over / click)
+    if hide_name_on_load:
+        try:
+            p.style.labelstyle.scale = 0  # hides the label on load
+        except Exception:
+            pass
+
+# Build multiple LineStrings from contiguous coordinate segments separated by blank rows
+def add_multisegment_linestrings(kml_folder, df, color_column="LineStringColor"):
     if df is None:
         return
-    df_clean = df.dropna(subset=["Latitude", "Longitude"])
-    coords = []
-    for _, row in df_clean.iterrows():
+    coords_segment = []
+    created_any = False
+    # iterate rows in order; blank lat/lon breaks a segment
+    for _, row in df.iterrows():
+        lat = row.get("Latitude", None)
+        lon = row.get("Longitude", None)
+        if pd.isna(lat) or pd.isna(lon):
+            # break: if we have a segment, create a LineString
+            if len(coords_segment) >= 2:
+                ls = kml_folder.newlinestring()
+                ls.coords = coords_segment
+                # set style using first non-null color in df (or per-row if desired)
+                if color_column in df.columns:
+                    non_null_colors = df[color_column].dropna().astype(str).str.strip()
+                    if len(non_null_colors) > 0:
+                        set_linestring_style(ls, non_null_colors.iloc[0])
+                created_any = True
+            coords_segment = []
+            continue
         try:
-            lat = float(row["Latitude"])
-            lon = float(row["Longitude"])
-            coords.append((lon, lat))
+            lat_f = float(lat)
+            lon_f = float(lon)
+            coords_segment.append((lon_f, lat_f))
         except Exception:
+            # skip invalid coordinate rows but do not break segment
             continue
 
-    if not coords:
-        return
+    # final segment
+    if len(coords_segment) >= 2:
+        ls = kml_folder.newlinestring()
+        ls.coords = coords_segment
+        if color_column in df.columns:
+            non_null_colors = df[color_column].dropna().astype(str).str.strip()
+            if len(non_null_colors) > 0:
+                set_linestring_style(ls, non_null_colors.iloc[0])
+        created_any = True
 
-    ls = kml_folder.newlinestring()
-    ls.coords = coords
-    if "LineStringColor" in df.columns:
-        non_null_colors = df["LineStringColor"].dropna().astype(str).str.strip()
-        if len(non_null_colors) > 0:
-            set_linestring_style(ls, non_null_colors.iloc[0])
+    return created_any
 
 # -----------------------------
 # File Upload
@@ -120,7 +146,6 @@ if uploaded:
     # Normalize sheet names to uppercase keys for consistent access
     normalized = {k.strip().upper(): v for k, v in df_dict.items()}
 
-    # Helper to safely get a dataframe by several possible keys
     def get_sheet(*keys):
         for k in keys:
             if k is None:
@@ -173,31 +198,46 @@ if uploaded:
         if df_agms is not None:
             folder = kml.newfolder(name="AGMs")
             for _, row in df_agms.iterrows():
-                add_point(folder, row, name_field="Name", icon_field="Icon", color_field="IconColor")
+                add_point(folder, row, name_field="Name", icon_field="Icon", color_field="IconColor", hide_name_on_load=False)
 
-        # ACCESS as LineString or points
+        # ACCESS as multi-segment LineStrings (blank rows break segments)
         if df_access is not None:
             folder = kml.newfolder(name="Access")
-            if len(df_access.dropna(subset=["Latitude", "Longitude"])) > 1:
-                add_linestring(folder, df_access)
-            else:
+            # If there are at least two coordinates in any contiguous segment, create linestring(s)
+            created = add_multisegment_linestrings(folder, df_access, color_column="LineStringColor")
+            if not created:
+                # fallback to points if no valid linestring segments found
                 for _, row in df_access.iterrows():
                     add_point(folder, row)
 
-        # CENTERLINE as LineString or points
+        # CENTERLINE as LineString (treat blanks as breaks too)
         if df_center is not None:
             folder = kml.newfolder(name="Centerline")
-            if len(df_center.dropna(subset=["Latitude", "Longitude"])) > 1:
-                add_linestring(folder, df_center)
-            else:
+            created = add_multisegment_linestrings(folder, df_center, color_column="LineStringColor")
+            if not created:
                 for _, row in df_center.iterrows():
                     add_point(folder, row)
 
-        # NOTES points
+        # NOTES points; hide name until mouseover if HideNameUntilMouseOver column is truthy
         if df_notes is not None:
             folder = kml.newfolder(name="Notes")
+            # Determine if the sheet has HideNameUntilMouseOver column
+            hide_col = None
+            for col in df_notes.columns:
+                if col.strip().upper() == "HIDENAMEUNTILMOUSEOVER":
+                    hide_col = col
+                    break
+
             for _, row in df_notes.iterrows():
-                add_point(folder, row, name_field="Name", icon_field="Icon", color_field=None)
+                hide_flag = False
+                if hide_col:
+                    val = row.get(hide_col)
+                    # treat truthy values: 1, '1', 'TRUE', 'Yes', etc.
+                    if pd.notna(val):
+                        sval = str(val).strip().lower()
+                        if sval in ("1", "true", "yes", "y", "t"):
+                            hide_flag = True
+                add_point(folder, row, name_field="Name", icon_field="Icon", color_field=None, hide_name_on_load=hide_flag)
 
         # Package KMZ
         kmz_bytes = io.BytesIO()
