@@ -273,4 +273,264 @@ def add_note_simple(folder, row, name_field="Name", icon_field="Icon"):
     except:
         pass
 
-    return href or safe_str(row.get(icon_field))
+    return href or safe_str(row.get(icon_field)) or ""
+
+# -------------------------
+# Post-process KML to make Notes reveal on hover
+# -------------------------
+def inject_hover_stylemaps_for_notes(kml_bytes):
+    """
+    Robustly reads icon href for Notes placemarks:
+      - inline Icon/href OR via Document Style referenced by placemark styleUrl
+    Then builds StyleMaps (normal hidden label / highlight visible label)
+    and points Notes placemarks to the StyleMap.
+
+    DOES NOT touch any non-Notes placemarks, lines, or their styles.
+    """
+    root = ET.fromstring(kml_bytes)
+    doc = root.find(".//" + Q("Document"))
+    if doc is None:
+        if root.tag == Q("Document"):
+            doc = root
+        else:
+            return kml_bytes
+
+    # Locate Notes folder
+    notes_folder = None
+    for folder in doc.findall(Q("Folder")):
+        name_el = folder.find(Q("name"))
+        if name_el is not None and name_el.text and name_el.text.strip().lower() == "notes":
+            notes_folder = folder
+            break
+    if notes_folder is None:
+        return kml_bytes
+
+    # Style id -> Style element map
+    style_by_id = {}
+    for st in doc.findall(Q("Style")):
+        sid = st.get("id")
+        if sid:
+            style_by_id[sid] = st
+
+    def href_from_style(style_el):
+        if style_el is None:
+            return None
+        href_el = style_el.find(".//" + Q("Icon") + "/" + Q("href"))
+        if href_el is not None and href_el.text:
+            return href_el.text.strip()
+        return None
+
+    def href_from_placemark(pm):
+        # 1) Inline icon href
+        href_el = pm.find(".//" + Q("Icon") + "/" + Q("href"))
+        if href_el is not None and href_el.text:
+            return href_el.text.strip()
+
+        # 2) styleUrl -> Document Style
+        su = pm.find(Q("styleUrl"))
+        if su is not None and su.text and su.text.strip().startswith("#"):
+            sid = su.text.strip()[1:]
+            return href_from_style(style_by_id.get(sid))
+
+        return None
+
+    # Collect hrefs used by Notes placemarks
+    hrefs = []
+    pm_to_href = []
+    for pm in notes_folder.findall(Q("Placemark")):
+        href = href_from_placemark(pm)
+        pm_to_href.append(href)
+        if href and href not in hrefs:
+            hrefs.append(href)
+
+    if not hrefs:
+        return kml_bytes
+
+    # Insert new styles before first Folder for compatibility
+    first_folder = doc.find(Q("Folder"))
+
+    def insert_before_first_folder(el):
+        if first_folder is None:
+            doc.append(el)
+        else:
+            idx = list(doc).index(first_folder)
+            doc.insert(idx, el)
+
+    href_to_sm = {}
+    for i, href in enumerate(hrefs, start=1):
+        sm_id = f"sm_notes_{i}"
+
+        # Normal = label hidden
+        st_n = ET.Element(Q("Style"), {"id": f"{sm_id}_normal"})
+        is_n = ET.SubElement(st_n, Q("IconStyle"))
+        ic_n = ET.SubElement(is_n, Q("Icon"))
+        ET.SubElement(ic_n, Q("href")).text = href
+        ls_n = ET.SubElement(st_n, Q("LabelStyle"))
+        ET.SubElement(ls_n, Q("scale")).text = "0.01"
+        ET.SubElement(ls_n, Q("color")).text = "00ffffff"
+
+        # Highlight = label visible
+        st_h = ET.Element(Q("Style"), {"id": f"{sm_id}_highlight"})
+        is_h = ET.SubElement(st_h, Q("IconStyle"))
+        ic_h = ET.SubElement(is_h, Q("Icon"))
+        ET.SubElement(ic_h, Q("href")).text = href
+        ls_h = ET.SubElement(st_h, Q("LabelStyle"))
+        ET.SubElement(ls_h, Q("scale")).text = "1"
+        ET.SubElement(ls_h, Q("color")).text = "ffffffff"
+
+        sm = ET.Element(Q("StyleMap"), {"id": sm_id})
+        p1 = ET.SubElement(sm, Q("Pair"))
+        ET.SubElement(p1, Q("key")).text = "normal"
+        ET.SubElement(p1, Q("styleUrl")).text = f"#{sm_id}_normal"
+        p2 = ET.SubElement(sm, Q("Pair"))
+        ET.SubElement(p2, Q("key")).text = "highlight"
+        ET.SubElement(p2, Q("styleUrl")).text = f"#{sm_id}_highlight"
+
+        insert_before_first_folder(st_n)
+        insert_before_first_folder(st_h)
+        insert_before_first_folder(sm)
+
+        href_to_sm[href] = sm_id
+
+    # Apply StyleMaps ONLY to Notes placemarks
+    for pm, href in zip(notes_folder.findall(Q("Placemark")), pm_to_href):
+        if not href:
+            continue
+        smid = href_to_sm.get(href)
+        if not smid:
+            continue
+
+        # remove existing styleUrl(s)
+        for existing in pm.findall(Q("styleUrl")):
+            pm.remove(existing)
+
+        # remove inline Style to prevent overrides
+        for inline_style in pm.findall(Q("Style")):
+            pm.remove(inline_style)
+
+        ET.SubElement(pm, Q("styleUrl")).text = f"#{smid}"
+
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+# -------------------------
+# UI and file handling
+# -------------------------
+uploaded_xlsx = st.file_uploader("Upload Google Earth Seed File (.xlsx)", type=["xlsx"])
+if not uploaded_xlsx:
+    st.stop()
+
+try:
+    df_dict = pd.read_excel(uploaded_xlsx, sheet_name=None)
+except Exception as e:
+    st.error(f"Failed to read Excel file: {e}")
+    st.stop()
+
+normalized = {k.strip().upper(): v for k, v in df_dict.items()}
+
+def get_sheet(*names):
+    for n in names:
+        if not n:
+            continue
+        key = n.strip().upper()
+        df = normalized.get(key)
+        if df is not None and not df.empty:
+            return df
+    return None
+
+df_agms = get_sheet("AGMS", "AGM")
+df_access = get_sheet("ACCESS")
+df_center = get_sheet("CENTERLINE")
+df_notes  = get_sheet("NOTES")
+
+tab1, tab2, tab3, tab4 = st.tabs(["AGMs", "Access", "Centerline", "Notes"])
+with tab1:
+    st.subheader("AGMs")
+    st.dataframe(df_agms if df_agms is not None else pd.DataFrame())
+with tab2:
+    st.subheader("Access")
+    st.dataframe(df_access if df_access is not None else pd.DataFrame())
+with tab3:
+    st.subheader("Centerline")
+    st.dataframe(df_center if df_center is not None else pd.DataFrame())
+with tab4:
+    st.subheader("Notes")
+    st.dataframe(df_notes if df_notes is not None else pd.DataFrame())
+
+debug_mode = st.checkbox("Show Notes debug table before packaging", value=True)
+
+# -------------------------
+# Generate KMZ
+# -------------------------
+if st.button("Generate KMZ"):
+    kml = simplekml.Kml()
+    notes_debug_rows = []
+
+    # Flexible color columns
+    agm_color_col = find_column(df_agms, "IconColor", "Color", "PointColor", "MarkerColor") if df_agms is not None else None
+    access_color_col = find_column(df_access, "LineStringColor", "Color", "LineColor") if df_access is not None else None
+    center_color_col = find_column(df_center, "LineStringColor", "Color", "LineColor") if df_center is not None else None
+
+    # AGMs
+    if df_agms is not None:
+        folder = kml.newfolder(name="AGMs")
+        for _, row in df_agms.iterrows():
+            color_val = row.get(agm_color_col) if agm_color_col else None
+            add_point_simple(folder, row, format_agm=True, color_value=color_val)
+
+    # Access
+    if df_access is not None:
+        folder = kml.newfolder(name="Access")
+        created = add_multisegment_linestrings(folder, df_access, color_col=access_color_col, drop_close_loop=True, close_loop_m=2.0)
+        if not created:
+            for _, row in df_access.iterrows():
+                add_point_simple(folder, row)
+
+    # Centerline
+    if df_center is not None:
+        folder = kml.newfolder(name="Centerline")
+        created = add_multisegment_linestrings(folder, df_center, color_col=center_color_col, drop_close_loop=True, close_loop_m=2.0)
+        if not created:
+            for _, row in df_center.iterrows():
+                add_point_simple(folder, row)
+
+    # Notes
+    if df_notes is not None:
+        folder = kml.newfolder(name="Notes")
+        for _, row in df_notes.iterrows():
+            href = add_note_simple(folder, row)
+            notes_debug_rows.append({
+                "Name": str(safe_str(row.get("Name")) or ""),
+                "IconHrefUsed": href or ""
+            })
+
+    if debug_mode:
+        if notes_debug_rows:
+            st.subheader("Notes debug output")
+            st.dataframe(pd.DataFrame(notes_debug_rows))
+        else:
+            st.info("No Notes placemarks found or no debug rows generated.")
+
+    # Build KML bytes, then inject StyleMaps ONLY for Notes
+    try:
+        raw_kml = kml.kml().encode("utf-8")
+        modified_kml = inject_hover_stylemaps_for_notes(raw_kml)
+    except Exception as e:
+        st.error(f"Failed to build or modify KML: {e}")
+        st.stop()
+
+    # Package KMZ
+    kmz_bytes = io.BytesIO()
+    try:
+        with zipfile.ZipFile(kmz_bytes, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("doc.kml", modified_kml)
+    except Exception as e:
+        st.error(f"Failed to build KMZ: {e}")
+        st.stop()
+
+    st.download_button(
+        label="Download KMZ",
+        data=kmz_bytes.getvalue(),
+        file_name="KMZ_Generator_Output.kmz",
+        mime="application/vnd.google-earth.kmz"
+    )
+    st.success("KMZ generated successfully.")
