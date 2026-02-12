@@ -38,6 +38,16 @@ MAP_NOTE_FALLBACK = "https://maps.google.com/mapfiles/kml/pal3/icon54.png"
 RED_X_ICON = "http://maps.google.com/mapfiles/kml/pal3/icon56.png"
 
 # -------------------------
+# AGM icon whitelist (YOUR EXACT REQUIRED OPTIONS)
+# -------------------------
+AGM_ALLOWED_ICON_URLS = {
+    "http://maps.google.com/mapfiles/kml/paddle/ylw-circle.png",   # Yellow Preliminary Location
+    "http://maps.google.com/mapfiles/kml/shapes/triangle.png",     # Purple Valve
+    "http://maps.google.com/mapfiles/kml/paddle/blu-circle.png",   # Blue Survey Point
+    "http://maps.google.com/mapfiles/kml/shapes/flag.png",         # Red AGM
+}
+
+# -------------------------
 # Helpers
 # -------------------------
 def safe_str(val):
@@ -71,12 +81,6 @@ def normalize_agm_name(raw_name):
     return s
 
 def normalize_color_value(val):
-    """
-    Accepts:
-      - 'Red', 'Purple', etc.
-      - 8-char hex aabbggrr
-    Returns 8-char KML color or None.
-    """
     c = safe_str(val)
     if not c:
         return None
@@ -127,7 +131,6 @@ def choose_note_icon_href(icon_value):
     return v
 
 def haversine_m(lat1, lon1, lat2, lon2):
-    """Distance in meters."""
     R = 6371000.0
     phi1 = math.radians(lat1)
     phi2 = math.radians(lat2)
@@ -136,66 +139,10 @@ def haversine_m(lat1, lon1, lat2, lon2):
     a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dl/2)**2
     return 2 * R * math.asin(math.sqrt(a))
 
-def coerce_int(val):
-    s = safe_str(val)
-    if s is None:
-        return None
-    try:
-        # handles "203", 203, 203.0
-        f = float(s)
-        if f.is_integer():
-            return int(f)
-    except:
-        pass
-    if re.fullmatch(r"\d+", s):
-        return int(s)
-    return None
-
-# -------------------------
-# AGM icon mapping (your requested options)
-# -------------------------
-AGM_ICON_CODE_MAP = {
-    # User requirement:
-    # 203 = yellow dot
-    # 204 = blue dot
-    # 208 = yellow (preliminary location)
-    203: "http://maps.google.com/mapfiles/kml/paddle/ylw-circle.png",
-    204: "http://maps.google.com/mapfiles/kml/paddle/blu-circle.png",
-    208: "http://maps.google.com/mapfiles/kml/paddle/ylw-pushpin.png",
-}
-
-def choose_agm_icon_href(icon_value):
-    """
-    Accepts:
-      - numeric codes like 203/204/208
-      - full URLs like http://maps.google.com/.../triangle.png
-    Returns a URL or None.
-    """
-    v = safe_str(icon_value)
-    if v is None:
-        return None
-
-    # If it's already a URL, use it as-is
-    if v.lower().startswith(("http://", "https://")):
-        return v
-
-    # If it's a known numeric code, map it
-    code = coerce_int(v)
-    if code is not None and code in AGM_ICON_CODE_MAP:
-        return AGM_ICON_CODE_MAP[code]
-
-    # Otherwise, return as-is (in case Earthpoint uses other codes/strings)
-    return v
-
 # -------------------------
 # Line builder (prevents "looping back" by splitting on big jumps)
 # -------------------------
 def add_lines_with_autosplit(folder, df, color_col="LineStringColor", split_jump_m=5000.0):
-    """
-    - Removes consecutive duplicates
-    - Auto-splits when consecutive points jump > split_jump_m meters
-      (prevents connecting separate line blocks into a big loop/circle)
-    """
     if df is None or df.empty:
         return False
 
@@ -229,7 +176,7 @@ def add_lines_with_autosplit(folder, df, color_col="LineStringColor", split_jump
             continue
 
         try:
-            pt = (float(lon), float(lat))  # KML expects (lon,lat)
+            pt = (float(lon), float(lat))
         except:
             continue
 
@@ -271,12 +218,17 @@ def add_agm_point(folder, row):
         pass
     p.coords = [(lon_f, lat_f)]
 
-    # EXACT shapes you specify, including numeric codes 203/204/208
-    href = choose_agm_icon_href(row.get("Icon"))
-    if href:
-        set_icon(p, href)
+    # AGM icon: MUST be one of your exact URLs
+    icon_raw = safe_str(row.get("Icon"))
+    if icon_raw:
+        icon_norm = icon_raw.strip()
+        if icon_norm in AGM_ALLOWED_ICON_URLS:
+            set_icon(p, icon_norm)
+        else:
+            # If it's not one of the four, do nothing (prevents unexpected Earthpoint substitutions)
+            pass
 
-    # Preserve color tinting if provided
+    # Tint by IconColor (Yellow/Purple/Blue/Red)
     set_icon_color(p, row.get("IconColor"))
     return True
 
@@ -301,7 +253,6 @@ def add_access_point(folder, row):
         pass
     p.coords = [(lon_f, lat_f)]
 
-    # Access sheet sometimes uses lowercase 'icon'
     if "icon" in row.index:
         set_icon(p, row.get("icon"))
     elif "Icon" in row.index:
@@ -339,8 +290,6 @@ def add_note_point(folder, row):
                 p.style.iconstyle.icon.href = MAP_NOTE_FALLBACK
             except:
                 pass
-
-    # Label behavior enforced via StyleMap injection later
     return href or ""
 
 # -------------------------
@@ -355,7 +304,6 @@ def inject_hover_stylemaps_for_notes_with_flags(kml_bytes, notes_flags_by_name, 
         else:
             return kml_bytes
 
-    # Find Notes folder (case-insensitive)
     notes_folder = None
     for folder in doc.findall(Q("Folder")):
         nm = folder.find(Q("name"))
@@ -371,7 +319,6 @@ def inject_hover_stylemaps_for_notes_with_flags(kml_bytes, notes_flags_by_name, 
     if notes_folder is None:
         return kml_bytes
 
-    # Style id -> Style element map (Document-level styles created by simplekml)
     style_by_id = {}
     for st in doc.findall(Q("Style")):
         sid = st.get("id")
@@ -387,12 +334,9 @@ def inject_hover_stylemaps_for_notes_with_flags(kml_bytes, notes_flags_by_name, 
         return None
 
     def href_from_pm(pm):
-        # inline href
         href_el = pm.find(".//" + Q("Icon") + "/" + Q("href"))
         if href_el is not None and href_el.text:
             return href_el.text.strip()
-
-        # styleUrl -> document style
         su = pm.find(Q("styleUrl"))
         if su is not None and su.text and su.text.strip().startswith("#"):
             sid = su.text.strip()[1:]
@@ -403,12 +347,11 @@ def inject_hover_stylemaps_for_notes_with_flags(kml_bytes, notes_flags_by_name, 
         n = pm.find(Q("name"))
         return (n.text or "").strip() if n is not None else ""
 
-    # Collect unique (href, hideflag) pairs used
     pairs = []
     pm_info = []
     for pm in notes_folder.findall(Q("Placemark")):
         name = get_name(pm)
-        hide_flag = bool(notes_flags_by_name.get(name, True))  # default True if missing
+        hide_flag = bool(notes_flags_by_name.get(name, True))
         href = href_from_pm(pm) or MAP_NOTE_FALLBACK
         pm_info.append((pm, href, hide_flag))
         key = (href, hide_flag)
@@ -418,7 +361,6 @@ def inject_hover_stylemaps_for_notes_with_flags(kml_bytes, notes_flags_by_name, 
     if not pairs:
         return kml_bytes
 
-    # Insert new styles before first Folder for compatibility
     first_folder = doc.find(Q("Folder"))
 
     def insert_before_first_folder(el):
@@ -428,17 +370,14 @@ def inject_hover_stylemaps_for_notes_with_flags(kml_bytes, notes_flags_by_name, 
             idx = list(doc).index(first_folder)
             doc.insert(idx, el)
 
-    # Build StyleMaps
     key_to_smid = {}
     for i, (href, hide_flag) in enumerate(pairs, start=1):
         sm_id = f"sm_notes_{i}"
 
-        # Normal style
         st_n = ET.Element(Q("Style"), {"id": f"{sm_id}_normal"})
         is_n = ET.SubElement(st_n, Q("IconStyle"))
         ic_n = ET.SubElement(is_n, Q("Icon"))
         ET.SubElement(ic_n, Q("href")).text = href
-
         ls_n = ET.SubElement(st_n, Q("LabelStyle"))
         if hide_flag:
             ET.SubElement(ls_n, Q("scale")).text = "0.01"
@@ -447,12 +386,10 @@ def inject_hover_stylemaps_for_notes_with_flags(kml_bytes, notes_flags_by_name, 
             ET.SubElement(ls_n, Q("scale")).text = "1"
             ET.SubElement(ls_n, Q("color")).text = "ffffffff"
 
-        # Highlight style (always visible)
         st_h = ET.Element(Q("Style"), {"id": f"{sm_id}_highlight"})
         is_h = ET.SubElement(st_h, Q("IconStyle"))
         ic_h = ET.SubElement(is_h, Q("Icon"))
         ET.SubElement(ic_h, Q("href")).text = href
-
         ls_h = ET.SubElement(st_h, Q("LabelStyle"))
         ET.SubElement(ls_h, Q("scale")).text = "1"
         ET.SubElement(ls_h, Q("color")).text = "ffffffff"
@@ -468,23 +405,16 @@ def inject_hover_stylemaps_for_notes_with_flags(kml_bytes, notes_flags_by_name, 
         insert_before_first_folder(st_n)
         insert_before_first_folder(st_h)
         insert_before_first_folder(sm)
-
         key_to_smid[(href, hide_flag)] = sm_id
 
-    # Apply StyleMaps to Notes placemarks
     for pm, href, hide_flag in pm_info:
         smid = key_to_smid.get((href, hide_flag))
         if not smid:
             continue
-
-        # Remove existing styleUrl(s)
         for existing in pm.findall(Q("styleUrl")):
             pm.remove(existing)
-
-        # Remove inline Style (so it cannot override the StyleMap)
         for inline_style in pm.findall(Q("Style")):
             pm.remove(inline_style)
-
         ET.SubElement(pm, Q("styleUrl")).text = f"#{smid}"
 
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
@@ -539,7 +469,7 @@ with tab4:
 if st.button("Generate KMZ"):
     kml = simplekml.Kml()
 
-    # Notes hide flags from df_notes
+    # Notes hide flags
     notes_flags_by_name = {}
     hide_col = None
     if df_notes is not None:
@@ -547,7 +477,6 @@ if st.button("Generate KMZ"):
             if str(c).strip().lower() == "hidenameuntilmouseover":
                 hide_col = c
                 break
-
         for _, row in df_notes.iterrows():
             nm = str(safe_str(row.get("Name")) or "").strip()
             hide_flag = True
@@ -565,7 +494,7 @@ if st.button("Generate KMZ"):
         for _, row in df_agms.iterrows():
             add_agm_point(folder, row)
 
-    # ACCESS (keeps LineStringColor)
+    # Access (keeps LineStringColor)
     if df_access is not None:
         folder = kml.newfolder(name="Access")
         created = add_lines_with_autosplit(folder, df_access, color_col="LineStringColor", split_jump_m=5000.0)
@@ -573,7 +502,7 @@ if st.button("Generate KMZ"):
             for _, row in df_access.iterrows():
                 add_access_point(folder, row)
 
-    # CENTERLINE (split on big jumps so it won't connect distant blocks)
+    # Centerline (split on big jumps so it won't connect distant blocks)
     if df_center is not None:
         folder = kml.newfolder(name="Centerline")
         created = add_lines_with_autosplit(folder, df_center, color_col="LineStringColor", split_jump_m=5000.0)
@@ -581,13 +510,13 @@ if st.button("Generate KMZ"):
             for _, row in df_center.iterrows():
                 add_access_point(folder, row)
 
-    # NOTES
+    # Notes
     if df_notes is not None:
         folder = kml.newfolder(name="Notes")
         for _, row in df_notes.iterrows():
             add_note_point(folder, row)
 
-    # Build KML then inject hover StyleMaps for Notes ONLY
+    # Build + inject hover styles for Notes only
     try:
         raw_kml = kml.kml().encode("utf-8")
         modified_kml = inject_hover_stylemaps_for_notes_with_flags(
